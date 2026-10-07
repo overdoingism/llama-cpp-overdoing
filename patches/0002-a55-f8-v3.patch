@@ -24,10 +24,10 @@ index 4d2e71803..27f1bd969 100644
              GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cu b/ggml/src/ggml-cuda/lf-fa-fp8.cu
 new file mode 100644
-index 000000000..39b27d348
+index 000000000..13365e852
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-fa-fp8.cu
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,601 @@
 +#include "lf-fa-fp8.cuh"
 +
 +#include <algorithm>
@@ -125,16 +125,49 @@ index 000000000..39b27d348
 +    if (j == 0 && lane == 0) ks[hk] = a > 0.f ? a / 448.f : 0.f;
 +}
 +
-+// V pass 1: per (kv head, group of 32 channels) amax over the cells.  A q8_0 block's largest |value| is exactly
-+// |d| * 127 (quantization maps the block's amax to +-127), so only the scales are read (1/17 of the cache).
++// The cells this batch can see, for the amax passes: a cell outside it (empty, another sequence, or not yet visible)
++// is never attended, and it must not set a scale either -- it may hold a previous request's data, which made the
++// scales (and so the output) depend on what ran before.  Derived mask: the batch's [min tok_lo, max tok_hi] and
++// cell_pos != INT32_MIN; f16 mask: the last query's row (one causal sequence).  vr = (lo, hi), or (1, 0) when unknown.
++__global__ void lf_fa_vis_range(const int * __restrict__ tok_lo, const int * __restrict__ tok_hi, const int n_q, int2 * __restrict__ vr) {
++    int lo = INT32_MAX, hi = INT32_MIN;
++    for (int i = threadIdx.x; i < n_q; i += blockDim.x) { lo = min(lo, tok_lo[i]); hi = max(hi, tok_hi[i]); }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        lo = min(lo, __shfl_xor_sync(0xFFFFFFFF, lo, o, 32));
++        hi = max(hi, __shfl_xor_sync(0xFFFFFFFF, hi, o, 32));
++    }
++    __shared__ int2 w[8];
++    if (threadIdx.x % 32 == 0) w[threadIdx.x / 32] = make_int2(lo, hi);
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        int2 r = w[0];
++        for (int k = 1; k < (int) (blockDim.x / 32); ++k) r = make_int2(min(r.x, w[k].x), max(r.y, w[k].y));
++        *vr = r;
++    }
++}
++
++static __device__ __forceinline__ bool lf_fa_cell_seen(const int j, const int * __restrict__ cell_pos, const int2 * __restrict__ vr,
++        const half * __restrict__ mlast) {
++    if (cell_pos) {
++        const int p = cell_pos[j];
++        return p != INT32_MIN && p >= vr->x && p <= vr->y;
++    }
++    if (mlast) return __half2float(mlast[j]) > -INFINITY;
++    return true;
++}
++
++// V pass 1: per (kv head, group of 32 channels) amax over the cells the batch sees.  A q8_0 block's largest |value| is
++// exactly |d| * 127 (quantization maps the block's amax to +-127), so only the scales are read (1/17 of the cache).
 +// Threads: (256 / NG) cells x NG = D/32 groups; chunks of 256 cells per block; atomicMax on the float bits.
 +template <int D>
 +__global__ void lf_fa_conv_v_amax(const char * __restrict__ V, const int64_t nb21, const int64_t nb22, const int n_kv,
-+        unsigned int * __restrict__ vbits) {
++        const int * __restrict__ cell_pos, const int2 * __restrict__ vr, const half * __restrict__ mlast, unsigned int * __restrict__ vbits) {
 +    constexpr int NG = D / 32;
 +    const int hk = blockIdx.x, b = threadIdx.x % NG, jj = threadIdx.x / NG, j0 = blockIdx.y * 256;
 +    float a = 0.f;
 +    for (int j = j0 + jj; j < min(n_kv, j0 + 256); j += 256 / NG) {
++        if (!lf_fa_cell_seen(j, cell_pos, vr, mlast)) continue;
 +        a = fmaxf(a, fabsf(__half2float(*(const half *) (V + j * nb21 + hk * nb22 + b * 34))));
 +    }
 +#pragma unroll
@@ -492,13 +525,13 @@ index 000000000..39b27d348
 +                              (size_t) HKV * D * sizeof(float), (size_t) n_q_pad * HQ * sizeof(float),
 +                              (size_t) HKV * (D / 32) * sizeof(unsigned int), (size_t) HKV * (D / 32) * sizeof(unsigned int),
 +                              (size_t) ns * n_q_pad * HQ * D * sizeof(half), (size_t) ns * n_q_pad * HQ * sizeof(float2),
-+                              (derived ? (size_t) nkv / LF_KT : 1) * sizeof(int2) };
++                              (derived ? (size_t) nkv / LF_KT : 1) * sizeof(int2), sizeof(int2) };
 +        size_t t = 0;
-+        for (int i = 0; i < 11; ++i) { if (out) out[i] = sz[i]; t += lf_fa_align(sz[i]); }
++        for (int i = 0; i < 12; ++i) { if (out) out[i] = sz[i]; t += lf_fa_align(sz[i]); }
 +        return t;
 +    };
 +    const size_t want = layout_bytes(n_kv_cap, LF_MAXSPLIT, nullptr);
-+    size_t sizes[11];
++    size_t sizes[12];
 +    const size_t total = layout_bytes(n_kv_pad, nsplit, sizes);
 +    char * scratch = lf_fa_arena_get(stream, total, want);
 +    ggml_cuda_pool_alloc<char> fallback(pool);
@@ -516,21 +549,26 @@ index 000000000..39b27d348
 +    half         * part  = (half *)         carve(sizes[8]);
 +    float2       * ml    = (float2 *)       carve(sizes[9]);
 +    int2         * trange = (int2 *)        carve(sizes[10]);
++    int2         * vrange = (int2 *)        carve(sizes[11]);
 +
-+    CUDA_CHECK(cudaMemsetAsync(kbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));
-+    lf_fa_conv_v_amax<D><<<dim3(HKV, (n_kv + 255) / 256), 256, 0, stream>>>((const char *) K->data, K->nb[1], K->nb[2], n_kv, kbits);
-+    lf_fa_conv_k<D><<<dim3((n_kv_pad + 7) / 8, HKV), 256, 0, stream>>>((const char *) K->data, K->nb[1], K->nb[2], n_kv, n_kv_pad, kbits, k8, ks);
-+    CUDA_CHECK(cudaMemsetAsync(vbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));
-+    lf_fa_conv_v_amax<D><<<dim3(HKV, (n_kv + 255) / 256), 256, 0, stream>>>((const char *) V->data, V->nb[1], V->nb[2], n_kv, vbits);
-+    lf_fa_conv_v_scale<D><<<HKV, D, 0, stream>>>(vbits, vs);
-+    lf_fa_conv_v<D><<<dim3(n_kv_pad / 64, HKV), D, 0, stream>>>((const char *) V->data, V->nb[1], V->nb[2], n_kv, n_kv_pad, vs, v8t);
-+    lf_fa_conv_q<D><<<dim3(n_q_pad / 8, HQ), 256, 0, stream>>>((const char *) Q->data, Q->nb[1], Q->nb[2], n_q, n_q_pad, HQ, q8, qs);
-+
++    // the cells this batch sees (for the amax passes): derived mask -> range of positions; f16 mask -> last query's row
 +    const int   * cell_pos = derived ? (const int *) dst->src[5]->data : nullptr;
 +    const int   * tok_lo   = derived ? (const int *) dst->src[6]->data : nullptr;
 +    const int   * tok_hi   = derived ? (const int *) dst->src[7]->data : nullptr;
 +    const char  * mdata    = !derived && mask ? (const char *) mask->data : nullptr;
 +    const int64_t nb31     = !derived && mask ? mask->nb[1] : 0;
++    const half  * mlast    = mdata ? (const half *) (mdata + (size_t) (n_q - 1) * nb31) : nullptr;
++    if (derived) lf_fa_vis_range<<<1, 256, 0, stream>>>(tok_lo, tok_hi, n_q, vrange);
++
++    CUDA_CHECK(cudaMemsetAsync(kbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));
++    lf_fa_conv_v_amax<D><<<dim3(HKV, (n_kv + 255) / 256), 256, 0, stream>>>((const char *) K->data, K->nb[1], K->nb[2], n_kv, cell_pos, vrange, mlast, kbits);
++    lf_fa_conv_k<D><<<dim3((n_kv_pad + 7) / 8, HKV), 256, 0, stream>>>((const char *) K->data, K->nb[1], K->nb[2], n_kv, n_kv_pad, kbits, k8, ks);
++    CUDA_CHECK(cudaMemsetAsync(vbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));
++    lf_fa_conv_v_amax<D><<<dim3(HKV, (n_kv + 255) / 256), 256, 0, stream>>>((const char *) V->data, V->nb[1], V->nb[2], n_kv, cell_pos, vrange, mlast, vbits);
++    lf_fa_conv_v_scale<D><<<HKV, D, 0, stream>>>(vbits, vs);
++    lf_fa_conv_v<D><<<dim3(n_kv_pad / 64, HKV), D, 0, stream>>>((const char *) V->data, V->nb[1], V->nb[2], n_kv, n_kv_pad, vs, v8t);
++    lf_fa_conv_q<D><<<dim3(n_q_pad / 8, HQ), 256, 0, stream>>>((const char *) Q->data, Q->nb[1], Q->nb[2], n_q, n_q_pad, HQ, q8, qs);
++
 +    const float scale_log2 = scale * 1.4426950408889634f;
 +    if (derived) lf_fa_tile_range<<<ntile, LF_KT, 0, stream>>>(cell_pos, n_kv, trange);
 +    const dim3 grid(n_q_pad / LF_QB, HKV, nsplit);
