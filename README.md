@@ -21,7 +21,7 @@ All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B U
 | reference (no patch) | — | 0.0018 / 0.0006 (run-to-run floor) |
 | K1 f16 | +14% / +15% | ≈ floor |
 | K1 fp8 (on top of f16) | +16% / +22% | 0.0027 / 0.0010 |
-| F8 | +3% / +17% | — |
+| F8 | +3% / +17% | 0.0020 / 0.0007 |
 | M4 (MXFP4 models only) | +55% at 8K, +44% at 110K | +≈0.001 over the MXFP4 weights themselves |
 
 Decode is unchanged.
