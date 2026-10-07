@@ -16,17 +16,21 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.
 
 All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt:
 
-| | prefill | KLD vs official UD-Q5_K_M (de / zh / en) |
+| | prefill | KLD vs official UD-Q5_K_M (zh / en) |
 |---|---|---|
-| reference (no patch) | — | 0.0011 / 0.0018 / 0.0006 (run-to-run floor) |
+| reference (no patch) | — | 0.0018 / 0.0006 (run-to-run floor) |
 | K1 f16 | +14% / +15% | ≈ floor |
-| K1 fp8 (on top of f16) | +16% / +22% | 0.0017 / 0.0027 / 0.0010 |
+| K1 fp8 (on top of f16) | +16% / +22% | 0.0027 / 0.0010 |
 | F8 | +3% / +17% | — |
 | M4 (MXFP4 models only) | +55% at 8K, +44% at 110K | +≈0.001 over the MXFP4 weights themselves |
 
 Decode is unchanged.
 
-## Versions
+## Switches
+
+Every switch, its values, and the server parameters it needs: [SWITCHES.md](SWITCHES.md).
+
+## Applicable versions
 
 - **Tested:** rdna-boosts `v16-a55e952b8-r8`: these three apply and build on the plain release; the numbers above come from a build
   that also had two bit-identical patches since sent to rdna-boosts.
@@ -35,13 +39,13 @@ Decode is unchanged.
 
 ## History
 
-Speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux), tokens/s.  Each entry: plain rdna-boosts, then
-with this repo's patches, all on.  The date links to the report (setup and KLD).
+Speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux), tokens/s.  `original`: plain rdna-boosts.
+Each dated row: this repo's patches of that date on it, all on; the date links to the report (setup and KLD).
 
 | date | build | Q5 prefill | Q5 decode | MXFP4 prefill | MXFP4 decode |
 |---|---|---|---|---|---|
-| [2026&#8209;10&#8209;07](reports/2026-10-07.md) | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 |
-| | + K1&nbsp;v2, F8&nbsp;v3.1, M4&nbsp;v2 | **1958** | 47.5 | **2393** | **63.0** |
+| original | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 |
+| [2026&#8209;10&#8209;07](reports/2026-10-07.md) | + K1&nbsp;v2, F8&nbsp;v3.1, M4&nbsp;v2 | **1958** | 47.5 | **2393** | **63.0** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
@@ -49,6 +53,7 @@ Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
 - [Linux](BUILD-linux.md)
 - [Windows](BUILD-windows.md)
+- Then: [switches](SWITCHES.md)
 
 ## Thanks
 
