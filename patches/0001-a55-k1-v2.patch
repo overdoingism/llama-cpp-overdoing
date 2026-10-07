@@ -1,0 +1,1307 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 037002238..5d315fa19 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1553,6 +1553,35 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+         }
+         llama_memory_clear(llama_get_memory(lctx), true);
+         llama_synchronize(lctx);
++
++        // Llama-Frankenstein K1: with the hipBLASLt prefill GEMM on, one full ubatch chooses its algorithm for every shape
++        // now (and loads its kernels) instead of during the first long prompt; the choices are printed as the table
++        // GGML_LF_KQ_BLAS_ALGOS accepts.
++        if (llama_model_has_decoder(model) && !llama_model_has_encoder(model) && !tmp.empty()) {
++            bool         (*lf_wants)() = nullptr;
++            const char * (*lf_algos)() = nullptr;
++            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
++                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
++                if (!lf_wants) lf_wants = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_lf_kq_blas_wants_warmup");
++                if (!lf_algos) lf_algos = (const char * (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_lf_kq_blas_algos");
++            }
++            if (lf_wants && lf_algos && lf_wants()) {
++                const int n = (int) std::min({llama_n_ubatch(lctx), llama_n_batch(lctx), llama_n_ctx(lctx)});
++                std::vector<llama_token> lf_tok(n, tmp[0]);
++                const int64_t t0 = ggml_time_us();
++                common_batch lf_batch = common_batch_get_one(lctx, lf_tok);
++                llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, lf_batch.get());
++                llama_memory_clear(llama_get_memory(lctx), true);
++                llama_synchronize(lctx);
++                const char * tbl = lf_algos();
++                if (tbl && *tbl) {
++                    LOG_INF("%s: K1 algorithms chosen in %.1f s (%d-token warm-up); the same choices as a table:\n"
++                            "GGML_LF_KQ_BLAS_ALGOS=%s\n", __func__, (ggml_time_us() - t0) / 1e6, n, tbl);
++                } else {
++                    LOG_INF("%s: K1 warm-up (%d tokens) took no hipBLASLt path (-ub below GGML_LF_KQ_BLAS_MIN_T?)\n", __func__, n);
++                }
++            }
++        }
+         llama_perf_context_reset(lctx);
+ 
+         // reset samplers to reset RNG state after warmup to the seeded state
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 2c7149122..5fb457f94 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2741,6 +2741,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
+         }
+     }
+ 
++    // Llama-Frankenstein K1b: GGML_LF_DRAFT_UB=N caps the draft model's ubatch (its compute buffer grows with n_ubatch)
++    // independently of the main model's, e.g. -ub 2048 for the main model's prompt processing with a 512 draft ubatch.
++    // The draft splits its prompt pass and feature injection by its own n_ubatch.
++    if (has_draft) {
++        const char * lf_ub = getenv("GGML_LF_DRAFT_UB");
++        const int32_t n = lf_ub ? atoi(lf_ub) : 0;
++        if (n > 0 && n < result.n_ubatch) {
++            result.n_ubatch = n;
++        }
++    }
++
+     result.cache_type_k  = params_spec.cache_type_k;
+     result.cache_type_v  = params_spec.cache_type_v;
+     result.n_outputs_max = params.n_parallel;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ac99e2871..6f68b7895 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -20,6 +20,7 @@
+ #include "ggml-cuda/conv2d-transpose.cuh"
+ #include "ggml-cuda/conv3d.cuh"
+ #include "ggml-cuda/convert.cuh"
++#include "ggml-cuda/lf-kq-blas.cuh"   // Llama-Frankenstein K1
+ #include "ggml-cuda/count-equal.cuh"
+ #include "ggml-cuda/cpy.cuh"
+ #include "ggml-cuda/cross-entropy-loss.cuh"
+@@ -2339,6 +2340,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+         return false;
+     }
+ 
++    // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes these matmuls unfused
++    if (is_mul_mat && ggml_cuda_lf_kq_blas_will_take(ffn_up)) {
++        return false;
++    }
++
+     return true;
+ }
+ 
+@@ -2523,6 +2529,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+ 
++    // Llama-Frankenstein K1: quantized prefill GEMM as f16 through hipBLASLt (GGML_LF_KQ_BLAS=f16, off by default)
++    if (ggml_cuda_lf_kq_blas_supported(ctx, src0, src1, dst)) {
++        ggml_cuda_lf_kq_blas_mul_mat(ctx, src0, src1, dst);
++        return;
++    }
++
+     // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
+     // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
+     // (n_tokens <= 8) stays on the existing kernels and W = 1..8 is bit-identical either way.
+@@ -4872,7 +4884,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         (node->op == GGML_OP_MUL_MAT_ID
+             ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
+             : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
+-    if (!pair_off && !mmb_pair_taken && (node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) && i + 1 < cgraph->n_nodes) {
++    // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes dense pairs unfused
++    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && ggml_cuda_lf_kq_blas_will_take(node);
++    if (!pair_off && !mmb_pair_taken && !lf_kq_pair_taken && (node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) && i + 1 < cgraph->n_nodes) {
+         ggml_tensor * next = cgraph->nodes[i + 1];
+         const ggml_tensor * src0 = node->src[0];
+         const ggml_tensor * src0_next = next->src[0];
+@@ -5097,7 +5111,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         const bool shape_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % 4 == 0 &&
+             node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
+             a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
+-        if (shape_ok && ggml_is_quantized(next->src[0]->type) && ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
++        // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes the down projection unfused
++        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) &&
++                ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
+                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+             ggml_cuda_mul_mat_q_swiglu_dense(*cuda_ctx, next->src[0], next, node);
+             return 1;
+@@ -7200,6 +7216,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     // The Q8_1 input cache is only valid within one graph execution.
+     cuda_ctx->q8_1_cache_clear();
++    ggml_cuda_lf_kq_blas_graph_begin();
+     ggml_cuda_mmb_set_active_ctx(cuda_ctx);
+     ggml_cuda_mmb_begin_graph();
+ 
+@@ -9201,6 +9218,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    // Llama-Frankenstein K1: startup warm-up hooks of the hipBLASLt prefill GEMM
++    if (strcmp(name, "ggml_backend_lf_kq_blas_wants_warmup") == 0) {
++        return (void *)ggml_cuda_lf_kq_blas_wants_warmup;
++    }
++    if (strcmp(name, "ggml_backend_lf_kq_blas_algos") == 0) {
++        return (void *)ggml_cuda_lf_kq_blas_algos_string;
++    }
+     return nullptr;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cu b/ggml/src/ggml-cuda/lf-kq-blas.cu
+new file mode 100644
+index 000000000..4ad058b8e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lf-kq-blas.cu
+@@ -0,0 +1,1100 @@
++#include "lf-kq-blas.cuh"
++#include "convert.cuh"
++
++#include <atomic>
++#include <cctype>
++#include <cmath>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <tuple>
++#include <algorithm>
++
++#if defined(GGML_LF_HIPBLASLT)
++#include <hipblaslt/hipblaslt.h>
++#include <hipblaslt/hipblaslt-ext.hpp>
++#include <string>
++#include <vector>
++#endif // defined(GGML_LF_HIPBLASLT)
++
++namespace {
++
++// 0 off, 1 f16, 2 fp8 (lossy experiment: the weight is rounded to fp8 per row and the hipBLASLt fp8 GEMM of M4 is used)
++int lf_kq_mode() {
++    static const int mode = [] {
++        const char * s = getenv("GGML_LF_KQ_BLAS");
++        if (s == nullptr || *s == '\0' || strcmp(s, "0") == 0) return 0;
++#if defined(GGML_LF_HIPBLASLT)
++        if (strcmp(s, "f16") == 0) return 1;
++        if (strcmp(s, "fp8") == 0) { GGML_LOG_INFO("GGML_LF_KQ_BLAS: fp8 prefill GEMM through hipBLASLt on (lossy)\n"); return 2; }
++        GGML_LOG_WARN("GGML_LF_KQ_BLAS=%s not recognized (f16, fp8), off\n", s);
++#else
++        GGML_LOG_WARN("GGML_LF_KQ_BLAS=%s: this build has no hipBLASLt (GGML_HIP_LF_HIPBLASLT), off\n", s);
++#endif // defined(GGML_LF_HIPBLASLT)
++        return 0;
++    }();
++    return mode;
++}
++bool lf_kq_on() { return lf_kq_mode() != 0; }
++int lf_kq_min_t() { static const int t = getenv("GGML_LF_KQ_BLAS_MIN_T") ? atoi(getenv("GGML_LF_KQ_BLAS_MIN_T")) : 1024; return t; }
++int lf_kq_log()   { static const int l = getenv("GGML_LF_KQ_BLAS_LOG")   ? atoi(getenv("GGML_LF_KQ_BLAS_LOG"))   : 0;    return l; }
++// GGML_LF_KQ_BLAS_ALGOS selects how the algorithms are chosen (nothing is ever read from or written to a file):
++//   unset          gfx1201: def.gfx1201v1; other GPUs: tune
++//   def.gfx1201v1  no timing: the highest-ranked candidate in the built-in gfx1201 priority list v1 (fixed results)
++//   K1a2.<base64>  a table printed at startup: no timing; anything missing takes the heuristic's first candidate
++//   tune           time the candidates on fixed pseudo-random activations at startup (the choice can differ from run
++//                  to run) and print the table
++//   0 / anything that does not parse: no timing, hipBLASLt's first heuristic candidate
++// Every mode prints its choices as a K1a2 table after the startup warm-up.
++const char * lf_kq_algos_env() { static const char * p = getenv("GGML_LF_KQ_BLAS_ALGOS"); return p && *p ? p : nullptr; }
++bool g_lf_kq_timed = false; // set by lf_kq_algos_init
++bool lf_kq_timed() { return g_lf_kq_timed; }
++
++// gfx1201 priority list v1: hipBLASLt solution indices of the f16 x f16 -> f32 GEMM (TN, alpha vector), best first.
++// Measured with tools/k1probe on gfx1201 / hipBLASLt 100401 8d1ae90e (Linux and Windows TheRock ROCm 10 builds are the
++// same), 80 (rows, tokens, K) shapes of the K1 path (K 5120 / 6144 / 17408, rows 48..17408, 1024..2048 tokens), on
++// random operands: ordered by geometric-mean slowdown against each shape's fastest candidate.  Taking the first listed
++// candidate the heuristic offers was 2.8% slower than the fastest on average (the heuristic's own first: 20.7%).
++// Used by def.gfx1201v1 and as the tie-break among near-equal timed candidates.
++const int LF_KQ_PRIO_GFX1201_V1[] = {
++    135741, 135732, 135625, 135716, 135382, 135627, 135631, 135378, 135383, 135375, 135361, 135633, 135311, 135381,
++    135628, 135189, 135187, 135727, 135630, 135626, 135349, 135376, 135657, 135712, 135365, 135609, 135647, 135616,
++    135380, 135620, 135613, 135765, 135740, 135648, 135651, 135602, 135372, 135623, 135601, 135624, 135605, 135697,
++    135660, 135210, 135341, 135695, 135379, 135209, 135688, 135362, 135310, 135359, 135617, 135696, 135659, 135661,
++    135532, 135384, 135761, 135699, 135764, 135559, 135301, 135749, 135505, 135186, 135303, 135254, 135738, 135760,
++    135700, 135733, 135307, 135787, 135227, 135213, 135653, 135743, 135652, 135202, 135654, 135698, 135655, 135621,
++    135650, 135702, 135404, 135216, 135703, 135694, 135638, 135255, 135462, 135640, 135664, 135678, 135321, 135641,
++    135636, 135367, 135691, 135679, 135785, 135683, 135680, 135769, 135687, 135693, 135669, 135786, 135685
++};
++constexpr uint32_t LF_KQ_PRIO_GFX1201_V1_LIB = 0x5cfec541u; // FNV-1a("hipblaslt 100401 8d1ae90e")
++// Token counts share an algorithm per 256-token bucket (floor(T / 256)), so a prompt's odd-sized last batch does not
++// trigger its own tuning (and its own, possibly different, choice).
++constexpr int LF_KQ_BUCKET = 256;
++
++// weight rows converted per GEMM call, from GGML_LF_KQ_BLAS_CHUNK_MB (f16 MiB per chunk, 0 = the whole matrix):
++// a multiple of 256 rows, at least 256
++int lf_kq_chunk_rows(const int M, const int K) {
++    static const int mb = getenv("GGML_LF_KQ_BLAS_CHUNK_MB") ? atoi(getenv("GGML_LF_KQ_BLAS_CHUNK_MB")) : 0;
++    if (mb <= 0) return M;
++    const int64_t rows = ((int64_t) mb << 20) / (2 * (int64_t) K);
++    return (int) std::min<int64_t>(M, std::max<int64_t>(256, rows / 256 * 256));
++}
++
++// the shape conditions shared by will_take (graph fusion stand-down) and supported (dispatch)
++bool lf_kq_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1) {
++    if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_MXFP4 || ggml_get_to_fp16_cuda(src0->type) == nullptr) return false;
++    if (src1->type != GGML_TYPE_F32 || src0->ne[2] != 1 || src0->ne[3] != 1) return false;
++    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
++    return src0->ne[0] % 64 == 0 && src0->ne[1] % 16 == 0 && T >= lf_kq_min_t() && T <= INT32_MAX / 8 && src0->ne[1] <= INT32_MAX / 8;
++}
++
++#if defined(GGML_LF_HIPBLASLT)
++
++__device__ __forceinline__ float lf_block_max(float v) {
++    __shared__ float red[256];
++    red[threadIdx.x] = v;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
++        __syncthreads();
++    }
++    return red[0];
++}
++
++// batch amax of the activations (non-negative floats compare as their bit patterns)
++__global__ void lf_kq_act_amax(const float * __restrict__ x, const int K, unsigned int * __restrict__ gbits) {
++    const float * row = x + (size_t) blockIdx.x * K;
++    float a = 0.f;
++    for (int k = threadIdx.x; k < K; k += blockDim.x) a = fmaxf(a, fabsf(row[k]));
++    a = lf_block_max(a);
++    if (threadIdx.x == 0) atomicMax(gbits, __float_as_uint(a));
++}
++
++// f16 activations with one power-of-two scale (amax < 2^15 after scaling): exact scaling, f16 rounding only
++__global__ void lf_kq_act_f16(const float * __restrict__ x, half * __restrict__ xh, const unsigned int * __restrict__ gbits,
++        float * __restrict__ sx, const int K) {
++    const float amax = __uint_as_float(*gbits);
++    int e = 0;
++    frexpf(amax, &e);
++    const float inv = amax > 0.f ? ldexpf(1.f, 15 - e) : 0.f;
++    const float * row = x + (size_t) blockIdx.x * K;
++    half * out = xh + (size_t) blockIdx.x * K;
++    for (int k = threadIdx.x; k < K; k += blockDim.x) out[k] = __float2half(row[k] * inv);
++    if (blockIdx.x == 0 && threadIdx.x == 0) *sx = amax > 0.f ? ldexpf(1.f, e - 15) : 1.f;
++}
++
++// alpha[m] = the batch activation scale (hipBLASLt's per-row alpha vector)
++__global__ void lf_kq_alpha(const float * __restrict__ sx, float * __restrict__ av, const int M) {
++    const int m = blockIdx.x * blockDim.x + threadIdx.x;
++    if (m < M) av[m] = *sx;
++}
++
++// fixed pseudo-random f16 operands for timing: K1's warm-up runs repeated BOS tokens, whose identical activation columns
++// draw less power than real activations and ranked the candidates differently in 39 of 80 probed shapes
++__global__ void lf_kq_fill_rand(half * __restrict__ x, const int64_t n) {
++    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
++        uint32_t h = (uint32_t) i * 2654435761u + 0x9E3779B9u;
++        h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
++        const float u = ((float) (h & 0xFFFF) + (float) (h >> 16)) / 65535.f - 1.f; // triangular in [-1, 1]
++        x[i] = __float2half(u * 2048.f);
++    }
++}
++
++#define LF_KQ_CHECK(x) do { const hipblasStatus_t st_ = (x); if (st_ != HIPBLAS_STATUS_SUCCESS) GGML_ABORT("%s failed: status %d", #x, (int) st_); } while (0)
++
++struct lf_kq_layout {
++    hipblasLtMatmulDesc_t   desc = nullptr;
++    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
++};
++struct lf_kq_algo {
++    hipblasLtMatmulAlgo_t algo{};
++    size_t                ws  = 0;
++    int                   idx = -1; // hipBLASLt solution index
++    bool                  ok  = false;
++};
++// One persistent scratch per stream (f16 activations | batch scale | f16 weight chunk | alpha vector | workspace),
++// grown on first use of a larger shape: the ggml pool would keep a freed buffer of every size it has seen.  Per stream,
++// not per device: the main model and the draft model run on different streams and may overlap.
++// The f16 activations and their scale stay at the start, so matmuls of one graph with the same input (q / k / v,
++// DeltaNet's qkv / z / alpha / beta, gate / up) convert it once: like the Q8_1 input cache, an entry holds until the
++// next graph (an input tensor is written once and is not changed while later matmuls of the graph still read it).
++struct lf_kq_scratch {
++    char * ptr  = nullptr;
++    size_t size = 0;
++    // the input whose conversion is in the scratch
++    const ggml_tensor * x_src = nullptr;
++    const void *        x_data = nullptr;
++    int                 x_T = 0, x_K = 0;
++    uint64_t            x_gen = 0;
++};
++typedef std::tuple<int, int, int, int, int> lf_kq_key; // (device, rows per call, T or bucket, K, M)
++struct lf_kq_state {
++    std::mutex mutex;
++    hipblasLtHandle_t handle = nullptr;
++    std::map<lf_kq_key, lf_kq_layout> layouts;  // per exact T
++    std::map<lf_kq_key, lf_kq_algo>   bucket;   // per T bucket: the chosen algorithm
++    std::map<lf_kq_key, lf_kq_algo>   resolved; // per exact T: the bucket's algorithm, checked for this T
++    std::map<cudaStream_t, lf_kq_scratch> scratch;
++    int probe[GGML_CUDA_MAX_DEVICES] = {}; // 0 = not tried, 1 = hipBLASLt has f16 kernels here, -1 = it has not
++    // algorithm table (GGML_LF_KQ_BLAS_ALGOS)
++    bool algos_init = false, algos_use = false, algos_missing_warned = false;
++    bool def_mode = false;          // def.gfx1201v1
++    std::map<int, int> prio;        // solution index -> position in the gfx1201 priority list (gfx1201 only)
++    std::map<std::tuple<int, int, int, int>, int> table; // (rows per call, bucket, K, M) -> hipBLASLt solution index
++};
++lf_kq_state & lf_kq() { static lf_kq_state s; return s; }
++std::atomic<uint64_t> g_lf_kq_graph_gen{1}; // advanced at every graph start: invalidates the converted inputs
++
++constexpr size_t LF_KQ_WS_MAX = 64ull << 20; // hipBLASLt workspace limit
++
++size_t lf_kq_align(const size_t n) { return (n + 255) / 256 * 256; }
++constexpr size_t LF_KQ_SCALE_BYTES = 256; // batch scale + amax bits, right after the f16 activations
++size_t lf_kq_scratch_bytes(const int Mc, const int T, const int K, const int M) {
++    return lf_kq_align((size_t) T * K * 2) + LF_KQ_SCALE_BYTES + lf_kq_align((size_t) Mc * K * 2) + lf_kq_align((size_t) M * 4) + LF_KQ_WS_MAX;
++}
++
++bool lf_kq_ready(const int device, cudaStream_t stream, const int Mc, const int T, const int K, const int M) {
++    lf_kq_state & st = lf_kq();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    auto it = st.scratch.find(stream);
++    return st.handle && st.resolved.count({device, Mc, T, K, M}) && it != st.scratch.end() && it->second.size >= lf_kq_scratch_bytes(Mc, T, K, M);
++}
++
++// Algorithm table string: "K1a2." + base64url (no padding) of
++//   u8 format (2) | u32 GPU architecture (FNV-1a of gcnArchName without feature flags, e.g. "gfx1201": must match) |
++//   u32 library (FNV-1a of "hipblaslt <version> <git rev>": a mismatch only warns -- a solution index of another build
++//   may name another kernel, but every choice is checked with matmulIsAlgoSupported before use) |
++//   u8 first bucket | u8 buckets | u8 shapes | u24 base index | u8 delta bytes (1..3) |
++//   per shape: u16 K/16, u16 M/16 (bit 15 set: rows per call == M), [u16 rows/16] |
++//   per shape and bucket: index - base in delta bytes (all ones = no entry) | u32 CRC-32 of everything before
++uint32_t lf_kq_fnv(const std::string & str) {
++    uint32_t h = 2166136261u;
++    for (unsigned char c : str) { h ^= c; h *= 16777619u; }
++    return h;
++}
++uint32_t lf_kq_crc32(const std::vector<uint8_t> & v, const size_t n) {
++    uint32_t c = 0xFFFFFFFFu;
++    for (size_t i = 0; i < n; ++i) {
++        c ^= v[i];
++        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
++    }
++    return ~c;
++}
++const char * LF_KQ_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++std::string lf_kq_b64enc(const std::vector<uint8_t> & v) {
++    std::string out;
++    for (size_t i = 0; i < v.size(); i += 3) {
++        const uint32_t n = (uint32_t) v[i] << 16 | (i + 1 < v.size() ? (uint32_t) v[i + 1] << 8 : 0) | (i + 2 < v.size() ? v[i + 2] : 0);
++        out += LF_KQ_B64[n >> 18 & 63];
++        out += LF_KQ_B64[n >> 12 & 63];
++        if (i + 1 < v.size()) out += LF_KQ_B64[n >> 6 & 63];
++        if (i + 2 < v.size()) out += LF_KQ_B64[n & 63];
++    }
++    return out;
++}
++bool lf_kq_b64dec(const std::string & s, std::vector<uint8_t> & v) {
++    uint32_t acc = 0; int bits = 0;
++    for (char ch : s) {
++        const char * p = strchr(LF_KQ_B64, ch);
++        if (ch == '\0' || p == nullptr) return false;
++        acc = acc << 6 | (uint32_t) (p - LF_KQ_B64); bits += 6;
++        if (bits >= 8) { bits -= 8; v.push_back((uint8_t) (acc >> bits & 0xFF)); }
++    }
++    return true;
++}
++
++std::string lf_kq_arch_name(const int device) {
++    hipDeviceProp_t prop;
++    CUDA_CHECK(hipGetDeviceProperties(&prop, device));
++    std::string a(prop.gcnArchName);
++    return a.substr(0, a.find(':'));
++}
++std::string lf_kq_lib_name(lf_kq_state & st) {
++    int ver = 0;
++    char rev[256] = {0};
++    hipblasLtGetVersion(st.handle, &ver);
++    hipblasLtGetGitRevision(st.handle, rev);
++    return "hipblaslt " + std::to_string(ver) + " " + std::string(rev);
++}
++
++void lf_kq_algos_init(lf_kq_state & st, const int device) {
++    if (st.algos_init) return;
++    st.algos_init = true;
++    const std::string arch = lf_kq_arch_name(device);
++    if (arch == "gfx1201") { // priority among near-equal timed candidates, and the order of def.gfx1201v1
++        const int n = (int) (sizeof(LF_KQ_PRIO_GFX1201_V1) / sizeof(LF_KQ_PRIO_GFX1201_V1[0]));
++        for (int i = 0; i < n; ++i) st.prio.emplace(LF_KQ_PRIO_GFX1201_V1[i], i);
++    }
++    std::string s;       // whitespace dropped: a table copied from a console often carries the line wraps
++    if (const char * env = lf_kq_algos_env()) {
++        for (const char * c = env; *c; ++c) {
++            if (!isspace((unsigned char) *c)) s += *c;
++        }
++    }
++    if (s.empty()) {
++        s = arch == "gfx1201" ? "def.gfx1201v1" : "tune";
++        fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS unset: %s on %s\n", s.c_str(), arch.c_str());
++    }
++    if (s == "tune") {
++        g_lf_kq_timed = true;
++        fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS=tune: algorithms timed at startup (the choice can differ from run to run; "
++                        "def.gfx1201v1 or the printed K1a2 table give fixed results)\n");
++        return;
++    }
++    st.algos_use = true; // no timing, whatever happens below
++    std::vector<uint8_t> v;
++    auto bad = [&](const char * why) { fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS: %s; using hipBLASLt's first heuristic choice\n", why); };
++    if (s == "0") { fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS=0: hipBLASLt's first heuristic choice, no timing\n"); return; }
++    if (s == "def.gfx1201v1") {
++        if (arch != "gfx1201") { bad(("def.gfx1201v1 is for gfx1201, this GPU is " + arch).c_str()); return; }
++        st.def_mode = true;
++        if (lf_kq_fnv(lf_kq_lib_name(st)) != LF_KQ_PRIO_GFX1201_V1_LIB) {
++            fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS: def.gfx1201v1 was measured with hipblaslt 100401 8d1ae90e, this is %s; "
++                            "using it anyway\n", lf_kq_lib_name(st).c_str());
++        }
++        fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS=def.gfx1201v1: built-in gfx1201 priority list v1, no timing\n");
++        return;
++    }
++    if (s.rfind("K1a1.", 0) == 0) { bad("K1a1 is the old format, time once more for a K1a2 string"); return; }
++    if (s.rfind("K1a2.", 0) != 0 || !lf_kq_b64dec(s.substr(5), v) || v.size() < 21) {
++        bad("not recognized (def.gfx1201v1, K1a2.<table>, tune or 0)"); return;
++    }
++    if (lf_kq_crc32(v, v.size() - 4) != ((uint32_t) v[v.size() - 4] | (uint32_t) v[v.size() - 3] << 8 | (uint32_t) v[v.size() - 2] << 16 | (uint32_t) v[v.size() - 1] << 24)) {
++        bad("checksum mismatch (incomplete copy?)"); return;
++    }
++    size_t o = 0;
++    auto u8  = [&]() { return o < v.size() ? (uint32_t) v[o++] : 0u; };
++    auto u16 = [&]() { const uint32_t a = u8(); return a | u8() << 8; };
++    if (u8() != 2) { bad("unknown format"); return; }
++    const uint32_t arch_lo = u16(), arch_hi = u16();
++    const uint32_t lib_lo  = u16(), lib_hi  = u16();
++    if ((arch_lo | arch_hi << 16) != lf_kq_fnv(lf_kq_arch_name(device))) {
++        bad(("made for another GPU architecture (this is " + lf_kq_arch_name(device) + ")").c_str()); return;
++    }
++    if ((lib_lo | lib_hi << 16) != lf_kq_fnv(lf_kq_lib_name(st))) {
++        fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS: made with another hipBLASLt build (this is %s); using it anyway, "
++                        "time once more if prefill got slower\n", lf_kq_lib_name(st).c_str());
++    }
++    const int b0 = (int) u8(), nb = (int) u8(), ns = (int) u8();
++    const uint32_t base_lo = u16(), base_hi = u8();
++    const uint32_t base = base_lo | base_hi << 16;
++    const int db = (int) u8();
++    if (db < 1 || db > 3) { bad("bad delta width"); return; }
++    struct shp { int K, M, mc; };
++    std::vector<shp> sh;
++    for (int i = 0; i < ns; ++i) {
++        const int K = (int) u16() * 16;
++        const uint32_t m = u16();
++        const int M = (int) (m & 0x7FFF) * 16;
++        const int mc = (m & 0x8000) ? M : (int) u16() * 16;
++        sh.push_back({K, M, mc});
++    }
++    const uint32_t none = (1u << (8 * db)) - 1;
++    int n = 0;
++    for (int i = 0; i < ns; ++i) {
++        for (int b = 0; b < nb; ++b) {
++            uint32_t d = 0;
++            for (int k = 0; k < db; ++k) d |= u8() << (8 * k);
++            if (d != none) { st.table[{sh[i].mc, b0 + b, sh[i].K, sh[i].M}] = (int) (base + d); ++n; }
++        }
++    }
++    if (o + 4 != v.size()) { st.table.clear(); bad("length mismatch"); return; }
++    fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS: %d choices for %d shapes x %d buckets, no timing\n", n, ns, nb);
++}
++
++std::string lf_kq_algos_export(lf_kq_state & st, const int device) {
++    std::map<std::tuple<int, int, int>, std::map<int, int>> shapes; // (K, M, rows per call) -> bucket -> index
++    int bmin = 1 << 30, bmax = -1;
++    uint32_t imin = 0xFFFFFFFFu, imax = 0;
++    for (const auto & e : st.bucket) {
++        const auto & [dev, mc, b, K, M] = e.first;
++        if (dev != device || !e.second.ok || e.second.idx < 0) continue;
++        shapes[{K, M, mc}][b] = e.second.idx;
++        bmin = std::min(bmin, b); bmax = std::max(bmax, b);
++        imin = std::min(imin, (uint32_t) e.second.idx); imax = std::max(imax, (uint32_t) e.second.idx);
++    }
++    if (shapes.empty() || bmax - bmin + 1 > 255 || shapes.size() > 255 || imax >= (1u << 24)) return "";
++    const int db = imax - imin < 255 ? 1 : (imax - imin < 65535 ? 2 : 3);
++    std::vector<uint8_t> v;
++    auto p8  = [&](uint32_t x) { v.push_back((uint8_t) x); };
++    auto p16 = [&](uint32_t x) { p8(x & 0xFF); p8(x >> 8 & 0xFF); };
++    p8(2);
++    const uint32_t arch = lf_kq_fnv(lf_kq_arch_name(device)), lib = lf_kq_fnv(lf_kq_lib_name(st));
++    p16(arch & 0xFFFF); p16(arch >> 16);
++    p16(lib & 0xFFFF); p16(lib >> 16);
++    p8(bmin); p8(bmax - bmin + 1); p8((uint32_t) shapes.size());
++    p16(imin & 0xFFFF); p8(imin >> 16);
++    p8(db);
++    for (const auto & s : shapes) {
++        const auto & [K, M, mc] = s.first;
++        p16(K / 16);
++        if (mc == M) { p16((M / 16) | 0x8000); } else { p16(M / 16); p16(mc / 16); }
++    }
++    const uint32_t none = (1u << (8 * db)) - 1;
++    for (const auto & s : shapes) {
++        for (int b = bmin; b <= bmax; ++b) {
++            auto it = s.second.find(b);
++            const uint32_t d = it == s.second.end() ? none : (uint32_t) it->second - imin;
++            for (int k = 0; k < db; ++k) p8(d >> (8 * k) & 0xFF);
++        }
++    }
++    const uint32_t c = lf_kq_crc32(v, v.size());
++    p16(c & 0xFFFF); p16(c >> 16);
++    return "K1a2." + lf_kq_b64enc(v);
++}
++
++// Once per device: does this hipBLASLt find f16 kernels for the GPU (its kernel library is a separate directory, see
++// HIPBLASLT_TENSILE_LIBPATH)?  If not, the path stays off with a warning instead of aborting at the first prompt.
++bool lf_kq_probe(const int device) {
++    lf_kq_state & st = lf_kq();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    if (st.probe[device] != 0) return st.probe[device] > 0;
++    st.probe[device] = -1;
++    if (!st.handle && hipblasLtCreate(&st.handle) != HIPBLAS_STATUS_SUCCESS) {
++        st.handle = nullptr;
++        fprintf(stderr, "GGML_LF_KQ_BLAS: hipblasLtCreate failed, off\n");
++        return false;
++    }
++    hipblasLtMatmulDesc_t desc = nullptr;
++    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
++    hipblasLtMatmulPreference_t pref = nullptr;
++    hipblasLtMatmulHeuristicResult_t res[1];
++    int nres = 0;
++    const hipblasOperation_t ta = HIPBLAS_OP_T, tb = HIPBLAS_OP_N;
++    const hipblasLtPointerMode_t pm = HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST;
++    bool ok = hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_POINTER_MODE, &pm, sizeof(pm)) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatrixLayoutCreate(&la, HIP_R_16F, 1024, 1024, 1024) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatrixLayoutCreate(&lb, HIP_R_16F, 1024, 1024, 1024) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatrixLayoutCreate(&lc, HIP_R_32F, 1024, 1024, 1024) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
++        hipblasLtMatmulAlgoGetHeuristic(st.handle, desc, la, lb, lc, lc, pref, 1, res, &nres) == HIPBLAS_STATUS_SUCCESS && nres > 0;
++    if (pref) hipblasLtMatmulPreferenceDestroy(pref);
++    if (lc) hipblasLtMatrixLayoutDestroy(lc);
++    if (lb) hipblasLtMatrixLayoutDestroy(lb);
++    if (la) hipblasLtMatrixLayoutDestroy(la);
++    if (desc) hipblasLtMatmulDescDestroy(desc);
++    if (!ok) {
++        fprintf(stderr, "GGML_LF_KQ_BLAS: hipBLASLt has no f16 kernels for this GPU (kernel library not found? set "
++                      "HIPBLASLT_TENSILE_LIBPATH to its hipblaslt\\library directory), off\n");
++        return false;
++    }
++    st.probe[device] = 1;
++    fprintf(stderr, "GGML_LF_KQ_BLAS: f16 prefill GEMM through hipBLASLt on\n");
++    return true;
++}
++
++#endif // defined(GGML_LF_HIPBLASLT)
++
++#if defined(GGML_LF_HIPBLASLT)
++// ------------------------------------------------------------------------------------------------ fp8 GEMM (K1 fp8 mode, shared with M4)
++// fp8 e4m3 activations with ONE scale for the whole batch (hipBLASLt on gfx1201 has no per-column scale mode, passed as the
++// device-side B scale), converted once per input and graph; the weight side is fp8 [M][K] with a per-row alpha vector.
++__global__ void lf_act_amax_global(const float * __restrict__ x, const int K, unsigned int * __restrict__ gbits) {
++    const float * row = x + (size_t) blockIdx.x * K;
++    float a = 0.f;
++    for (int k = threadIdx.x; k < K; k += blockDim.x) a = fmaxf(a, fabsf(row[k]));
++    __shared__ float red[256];
++    red[threadIdx.x] = a;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) atomicMax(gbits, __float_as_uint(red[0]));
++}
++
++// the same maximum over the whole contiguous activation: float4 grid-stride loads, wave reduction, one atomic per wave (the per-row
++// launch above runs one 256-thread block per token with a shared-memory tree: ~60% slower than the quantization pass that follows);
++// a maximum does not depend on the order, so the result is bit-identical.  GGML_LF_MXFP4_AMAX=row selects the per-row kernel.
++__global__ void lf_act_amax_flat(const float4 * __restrict__ x, const int64_t n4, unsigned int * __restrict__ gbits) {
++    float a = 0.f;
++    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
++        const float4 v = x[i];
++        a = fmaxf(a, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
++    if ((threadIdx.x & 31) == 0) atomicMax(gbits, __float_as_uint(a));
++}
++
++__global__ void lf_quant_act_fp8_global(const float * __restrict__ x, uint8_t * __restrict__ xq, const unsigned int * __restrict__ gbits,
++        float * __restrict__ sx, const int K) {
++#if defined(RDNA4)
++    const float amax = __uint_as_float(*gbits);
++    const float inv  = amax > 0.f ? 448.f / amax : 0.f;
++    const float * row = x + (size_t) blockIdx.x * K;
++    for (int k = 4 * threadIdx.x; k < K; k += 4 * blockDim.x) {
++        const float4 v = *(const float4 *) (row + k);
++        int w = __builtin_amdgcn_cvt_pk_fp8_f32(v.x * inv, v.y * inv, 0, false);
++        w     = __builtin_amdgcn_cvt_pk_fp8_f32(v.z * inv, v.w * inv, w, true);
++        *(int *) (xq + (size_t) blockIdx.x * K + k) = w;
++    }
++    if (blockIdx.x == 0 && threadIdx.x == 0) *sx = amax > 0.f ? amax / 448.f : 1.f;
++#else
++    GGML_UNUSED_VARS(x, xq, gbits, sx, K);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// gfx1201 fp8 priority list v1 for the blaslt path: hipBLASLt solution indices of the fp8 e4m3 x e4m3 -> f32 GEMM (TN, alpha
++// vector, B scale pointer), best first.  Measured with tools/k1probe/k8probe on gfx1201 / hipBLASLt 100401 8d1ae90e, 32 shapes
++// (rows 48..17408, K 5120 / 6144 / 17408, 512..2048 tokens), ordered by geometric-mean slowdown against each shape's fastest
++// candidate.  Weighted by the 27B layer mix, the listed choice is 1.9% slower than the per-shape fastest (the heuristic's first
++// candidate: +20%).
++const int LF_MX_PRIO_GFX1201_V1[] = {
++    131358, 131361, 131375, 131362, 131367, 131364, 131368, 131392, 131425, 131413, 131481, 131497, 131365, 131482,
++    131496, 131485, 131354, 131419, 131448, 131507, 131458, 131395, 131461, 131380, 131503, 131360, 131385, 130764,
++    130744, 130763, 131452, 131446, 131418, 131421, 131410, 131498, 131456, 131506, 131435, 131343, 130774, 130770,
++    130769, 131342, 131049, 130746, 131082, 130759, 131154, 130823, 130765, 131065, 130752, 131152, 130819, 130787,
++    131187, 130828, 131426, 130749, 131033, 131379, 130838, 131067
++};
++
++#define LF_BLT_CHECK(x) do { const hipblasStatus_t st_ = (x); if (st_ != HIPBLAS_STATUS_SUCCESS) GGML_ABORT("%s failed: status %d", #x, (int) st_); } while (0)
++
++struct lf_blt_shape {
++    hipblasLtMatmulDesc_t   desc = nullptr;
++    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
++    hipblasLtMatmulAlgo_t   algo{};
++    size_t                  ws = 0;
++};
++struct lf_blt_state {
++    std::mutex mutex;
++    hipblasLtHandle_t handle = nullptr;
++    std::map<std::tuple<int, int, int>, lf_blt_shape> shapes;
++    // fp8 activations + batch scale per stream, kept across the MUL_MATs of one graph that read the same input
++    struct act { uint8_t * ptr = nullptr; size_t size = 0; const void * x_src = nullptr; const void * x_data = nullptr;
++                 int T = 0, K = 0; uint64_t gen = 0; };
++    std::map<cudaStream_t, act> acts;
++};
++std::atomic<uint64_t> g_lf_fp8_graph_gen{1}; // advanced at every graph start: invalidates the converted inputs
++lf_blt_state & lf_blt() { static lf_blt_state s; return s; }
++
++// fp8 activations (shared per input and graph) + hipBLASLt fp8 GEMM: y[M][T] = av[m] * sx * (w8[m] . xq[t]); the caller holds st.mutex
++void lf_blt_gemm(ggml_backend_cuda_context & ctx, lf_blt_state & st, const ggml_tensor * src1, const float * av, const uint8_t * w8_ptr,
++        const float * x, float * y, const int M, const int T, const int K) {
++    cudaStream_t stream = ctx.stream();
++    struct { const uint8_t * get() const { return p; } const uint8_t * p; } w8{w8_ptr};
++    static const bool share = !getenv("GGML_LF_MXFP4_SHARE") || atoi(getenv("GGML_LF_MXFP4_SHARE")) != 0;
++    lf_blt_state::act & ac = st.acts[stream];
++    const size_t act_bytes = ((size_t) T * K + 255) / 256 * 256 + 256;
++    if (ac.size < act_bytes) {
++        if (ac.ptr) {
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            CUDA_CHECK(cudaFree(ac.ptr));
++        }
++        CUDA_CHECK(cudaMalloc((void **) &ac.ptr, act_bytes));
++        ac.size = act_bytes;
++        ac.x_src = nullptr;
++    }
++    uint8_t * xqp = ac.ptr;
++    float * sxp_dev = (float *) (ac.ptr + ((size_t) T * K + 255) / 256 * 256);
++    unsigned int * gbp = (unsigned int *) (sxp_dev + 16);
++    const ggml_tensor * x_src = src1;
++    while (x_src->view_src != nullptr) x_src = x_src->view_src;
++    const uint64_t gen = g_lf_fp8_graph_gen.load(std::memory_order_relaxed);
++    if (!share || ac.x_src != x_src || ac.x_data != x || ac.T != T || ac.K != K || ac.gen != gen) {
++        CUDA_CHECK(cudaMemsetAsync(gbp, 0, sizeof(unsigned int), stream));
++        static const bool amax_row = getenv("GGML_LF_MXFP4_AMAX") && strcmp(getenv("GGML_LF_MXFP4_AMAX"), "row") == 0;
++        if (amax_row) {
++            lf_act_amax_global<<<T, 256, 0, stream>>>(x, K, gbp);
++        } else {
++            const int64_t n4 = (int64_t) T * K / 4;
++            const int blocks = (int) std::min<int64_t>(2048, (n4 + 255) / 256);
++            lf_act_amax_flat<<<blocks, 256, 0, stream>>>((const float4 *) x, n4, gbp);
++        }
++        lf_quant_act_fp8_global<<<T, 256, 0, stream>>>(x, xqp, gbp, sxp_dev, K);
++        ac.x_src = x_src; ac.x_data = x; ac.T = T; ac.K = K; ac.gen = gen;
++    }
++    struct { uint8_t * get() const { return p; } uint8_t * p; } xq{xqp};
++    struct { float * get() const { return p; } float * p; } sx{sxp_dev};
++
++    const float beta = 0.f;
++    lf_blt_shape & sh = st.shapes[{M, T, K}];
++    const bool fresh = sh.desc == nullptr;
++    if (fresh) {
++        LF_BLT_CHECK(hipblasLtMatmulDescCreate(&sh.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
++        const hipblasOperation_t ta = HIPBLAS_OP_T, tb = HIPBLAS_OP_N;
++        const hipblasLtPointerMode_t pm = HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST;
++        LF_BLT_CHECK(hipblasLtMatmulDescSetAttribute(sh.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
++        LF_BLT_CHECK(hipblasLtMatmulDescSetAttribute(sh.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
++        LF_BLT_CHECK(hipblasLtMatmulDescSetAttribute(sh.desc, HIPBLASLT_MATMUL_DESC_POINTER_MODE, &pm, sizeof(pm)));
++        LF_BLT_CHECK(hipblasLtMatrixLayoutCreate(&sh.la, HIP_R_8F_E4M3, K, M, K));
++        LF_BLT_CHECK(hipblasLtMatrixLayoutCreate(&sh.lb, HIP_R_8F_E4M3, K, T, K));
++        LF_BLT_CHECK(hipblasLtMatrixLayoutCreate(&sh.lc, HIP_R_32F, M, T, M));
++    }
++    const float * sxp = sx.get();
++    LF_BLT_CHECK(hipblasLtMatmulDescSetAttribute(sh.desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sxp, sizeof(sxp)));
++
++    // algorithm choice: the heuristic's first candidate (default; no timing, the same choice every run), or with
++    // GGML_LF_MXFP4_ALGOS=timed the fastest of the heuristic's candidates timed on the first full batch of each shape
++    // (T % 512 == 0; the choice can differ from run to run because of timing noise, and so can the outputs)
++    // GGML_LF_MXFP4_ALGOS: unset = the gfx1201 fp8 priority list (no timing, the same choice every run), heur = the heuristic's
++    // first candidate, timed = the fastest candidate timed on the first full batch (T % 512 == 0) of each shape (old behaviour;
++    // the choice, and so the outputs, can differ from run to run)
++    static const int algo_mode = [] {
++        const char * e = getenv("GGML_LF_MXFP4_ALGOS");
++        if (e && strcmp(e, "timed") == 0) return 2;
++        if (e && strcmp(e, "heur") == 0) return 1;
++        return 0;
++    }();
++    if (fresh && algo_mode == 0) {
++        const size_t ws_max = 64ull << 20;
++        hipblasLtMatmulPreference_t pref;
++        LF_BLT_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
++        LF_BLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_max, sizeof(ws_max)));
++        hipblasLtMatmulHeuristicResult_t res[32];
++        int nres = 0;
++        LF_BLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(st.handle, sh.desc, sh.la, sh.lb, sh.lc, sh.lc, pref, 32, res, &nres));
++        hipblasLtMatmulPreferenceDestroy(pref);
++        if (nres == 0) GGML_ABORT("hipBLASLt has no fp8 algorithm for M=%d N=%d K=%d", M, T, K);
++        constexpr int np = (int) (sizeof(LF_MX_PRIO_GFX1201_V1) / sizeof(LF_MX_PRIO_GFX1201_V1[0]));
++        auto rank_of = [&](const int i) {   // listed candidates first, the rest after them in the heuristic's order
++            const int idx = hipblaslt_ext::getIndexFromAlgo(res[i].algo);
++            for (int k = 0; k < np; ++k) if (LF_MX_PRIO_GFX1201_V1[k] == idx) return k;
++            return 1000 + i;
++        };
++        int bi = -1;
++        for (int i = 0; i < nres; ++i) {
++            if (res[i].workspaceSize <= ws_max && (bi < 0 || rank_of(i) < rank_of(bi))) bi = i;
++        }
++        if (bi < 0) bi = 0;
++        sh.algo = res[bi].algo;
++        sh.ws   = res[bi].workspaceSize;
++        if (lf_kq_log()) fprintf(stderr, "LF_FP8 blaslt M=%d N=%d K=%d: priority-list choice %d (rank %d of %d candidates)\n",
++                              M, T, K, hipblaslt_ext::getIndexFromAlgo(res[bi].algo), rank_of(bi), nres);
++    } else if (fresh && (T % 512 != 0 || algo_mode == 1)) {
++        // a prompt's odd-sized last batch: every prompt length is a new shape, so timing it would re-tune on almost every
++        // request -- take the heuristic's first candidate
++        const size_t ws_max = 64ull << 20;
++        hipblasLtMatmulPreference_t pref;
++        LF_BLT_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
++        LF_BLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_max, sizeof(ws_max)));
++        hipblasLtMatmulHeuristicResult_t res[1];
++        int nres = 0;
++        LF_BLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(st.handle, sh.desc, sh.la, sh.lb, sh.lc, sh.lc, pref, 1, res, &nres));
++        hipblasLtMatmulPreferenceDestroy(pref);
++        if (nres == 0) GGML_ABORT("hipBLASLt has no fp8 algorithm for M=%d N=%d K=%d", M, T, K);
++        sh.algo = res[0].algo;
++        sh.ws   = res[0].workspaceSize;
++    } else if (fresh) {
++        // pick the fastest of the heuristic's candidates on the real operands (the last run leaves the right result)
++        const size_t ws_max = 64ull << 20;
++        hipblasLtMatmulPreference_t pref;
++        LF_BLT_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
++        LF_BLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_max, sizeof(ws_max)));
++        hipblasLtMatmulHeuristicResult_t res[16];
++        int nres = 0;
++        LF_BLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(st.handle, sh.desc, sh.la, sh.lb, sh.lc, sh.lc, pref, 16, res, &nres));
++        hipblasLtMatmulPreferenceDestroy(pref);
++        if (nres == 0) GGML_ABORT("hipBLASLt has no fp8 algorithm for M=%d N=%d K=%d", M, T, K);
++        size_t wsz = 0;
++        for (int i = 0; i < nres; ++i) wsz = std::max(wsz, res[i].workspaceSize);
++        ggml_cuda_pool_alloc<char> ws(ctx.pool(), std::max<size_t>(wsz, 1));
++        hipEvent_t e0, e1;
++        CUDA_CHECK(hipEventCreate(&e0)); CUDA_CHECK(hipEventCreate(&e1));
++        float best = 1e30f; int bi = 0;
++        for (int i = 0; i < nres; ++i) {
++            float tsum = 0.f; bool ok = true;
++            for (int r = 0; r < 3 && ok; ++r) {
++                CUDA_CHECK(hipEventRecord(e0, stream));
++                ok = hipblasLtMatmul(st.handle, sh.desc, av, w8.get(), sh.la, xq.get(), sh.lb, &beta, y, sh.lc, y, sh.lc,
++                                     &res[i].algo, ws.get(), res[i].workspaceSize, stream) == HIPBLAS_STATUS_SUCCESS;
++                CUDA_CHECK(hipEventRecord(e1, stream));
++                CUDA_CHECK(hipEventSynchronize(e1));
++                float ms = 0.f; CUDA_CHECK(hipEventElapsedTime(&ms, e0, e1));
++                if (r > 0) tsum += ms;
++            }
++            if (ok && tsum < best) { best = tsum; bi = i; }
++        }
++        CUDA_CHECK(hipEventDestroy(e0)); CUDA_CHECK(hipEventDestroy(e1));
++        sh.algo = res[bi].algo;
++        sh.ws   = res[bi].workspaceSize;
++        if (lf_kq_log()) fprintf(stderr, "LF_FP8 blaslt M=%d N=%d K=%d: %d candidates, picked %d (%.1f us)\n", M, T, K, nres, bi, best * 500.f);
++    }
++    ggml_cuda_pool_alloc<char> ws(ctx.pool(), std::max<size_t>(sh.ws, 1));
++    LF_BLT_CHECK(hipblasLtMatmul(st.handle, sh.desc, av, w8.get(), sh.la, xq.get(), sh.lb, &beta, y, sh.lc, y, sh.lc,
++                                 &sh.algo, ws.get(), sh.ws, stream));
++}
++// ------------------------------------------------------------------------------------------------ K-quant -> fp8 (K1 fp8 mode)
++// GGML_LF_KQ_BLAS=fp8 (dispatched from ggml_cuda_lf_kq_blas_mul_mat): any quantized weight with a to_fp16 kernel is dequantized to f16 in row
++// chunks and rounded to fp8 e4m3 with one scale per row (row amax / 448, computed once per weight tensor and cached; it also
++// serves as hipBLASLt's per-row alpha), then multiplied with the shared fp8 activations by the hipBLASLt fp8 GEMM below (shared with M4).
++// Lossy: K-quant values are not fp8 values (unlike MXFP4), on top of the fp8 activations.
++__global__ void lf_kq_row_scale(const half * __restrict__ w16, const int K, float * __restrict__ scale) {
++    const half * row = w16 + (size_t) blockIdx.x * K;
++    float a = 0.f;
++    for (int k = threadIdx.x; k < K; k += blockDim.x) a = fmaxf(a, fabsf(__half2float(row[k])));
++    __shared__ float red[256];
++    red[threadIdx.x] = a;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) scale[blockIdx.x] = red[0] > 0.f ? red[0] / 448.f : 1.f;
++}
++
++__global__ void lf_kq_f16_to_fp8(const half * __restrict__ w16, const float * __restrict__ scale, uint8_t * __restrict__ w8,
++        const int K, const int64_t n4) {
++#if defined(RDNA4)
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // 4 values per thread
++    if (i >= n4) return;
++    const int64_t e = 4 * i;
++    const float inv = 1.f / scale[e / K];
++    const half2 a = *(const half2 *) (w16 + e), b = *(const half2 *) (w16 + e + 2);
++    int w = __builtin_amdgcn_cvt_pk_fp8_f32(__low2float(a) * inv, __high2float(a) * inv, 0, false);
++    w     = __builtin_amdgcn_cvt_pk_fp8_f32(__low2float(b) * inv, __high2float(b) * inv, w, true);
++    *(int *) (w8 + e) = w;
++#else
++    GGML_UNUSED_VARS(w16, scale, w8, K, n4);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++struct lf_kq_fp8_cache {
++    std::mutex mutex;
++    std::map<std::tuple<const void *, int64_t, int64_t, int>, float *> scale; // per weight tensor: row scales (= alpha vector)
++};
++lf_kq_fp8_cache & lf_kq8() { static lf_kq_fp8_cache c; return c; }
++
++float * lf_kq8_scale_lookup(const ggml_tensor * src0, const int device) {
++    lf_kq_fp8_cache & c = lf_kq8();
++    std::lock_guard<std::mutex> lock(c.mutex);
++    auto it = c.scale.find({src0->data, src0->ne[0], src0->ne[1], device});
++    return it == c.scale.end() ? nullptr : it->second;
++}
++#endif // defined(GGML_LF_HIPBLASLT)
++
++} // namespace
++
++bool ggml_cuda_lf_fp8_gemm_ready(const int M, const int T, const int K) {
++#if defined(GGML_LF_HIPBLASLT)
++    lf_blt_state & st = lf_blt();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    return st.handle && st.shapes.count({M, T, K});
++#else
++    GGML_UNUSED_VARS(M, T, K);
++    return false;
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++void ggml_cuda_lf_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const float * av, const uint8_t * w8, float * y,
++        const int M, const int T, const int K) {
++#if defined(GGML_LF_HIPBLASLT)
++    lf_blt_state & st = lf_blt();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    if (!st.handle) LF_BLT_CHECK(hipblasLtCreate(&st.handle));
++    lf_blt_gemm(ctx, st, src1, av, w8, (const float *) src1->data, y, M, T, K);
++#else
++    GGML_UNUSED_VARS(ctx, src1, av, w8, y, M, T, K);
++    GGML_ABORT("the fp8 GEMM needs hipBLASLt");
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++bool ggml_cuda_lf_kq_fp8_ready(const ggml_tensor * src0, const int device, const int M, const int T, const int K) {
++#if defined(GGML_LF_HIPBLASLT)
++    if (lf_kq8_scale_lookup(src0, device) == nullptr) return false;
++    lf_blt_state & st = lf_blt();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    return st.handle && st.shapes.count({M, T, K});
++#else
++    GGML_UNUSED_VARS(src0, device, M, T, K);
++    return false;
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++void ggml_cuda_lf_kq_fp8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++#if defined(GGML_LF_HIPBLASLT)
++    cudaStream_t stream = ctx.stream();
++    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
++    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
++    GGML_ASSERT(to_fp16 != nullptr && K % 4 == 0);
++    float * scale = lf_kq8_scale_lookup(src0, ctx.device);
++    const bool first = scale == nullptr;
++    if (first) CUDA_CHECK(cudaMalloc((void **) &scale, (size_t) M * sizeof(float)));
++    // dequantize in row chunks of <= 64 MiB of f16 (whole quant blocks: a row is a multiple of the block size)
++    const int rows = (int) std::min<int64_t>(M, std::max<int64_t>(16, (64ll << 20) / (2ll * K)));
++    ggml_cuda_pool_alloc<half>    w16(ctx.pool(), (size_t) rows * K);
++    ggml_cuda_pool_alloc<uint8_t> w8(ctx.pool(), (size_t) M * K);
++    for (int r0 = 0; r0 < M; r0 += rows) {
++        const int mc = std::min(rows, M - r0);
++        to_fp16((const char *) src0->data + (size_t) r0 * src0->nb[1], w16.get(), (int64_t) mc * K, stream);
++        if (first) lf_kq_row_scale<<<mc, 256, 0, stream>>>(w16.get(), K, scale + r0);
++        const int64_t n4 = (int64_t) mc * K / 4;
++        lf_kq_f16_to_fp8<<<(unsigned) ((n4 + 255) / 256), 256, 0, stream>>>(w16.get(), scale + r0, w8.get() + (size_t) r0 * K, K, n4);
++    }
++    if (first) {
++        lf_kq_fp8_cache & c = lf_kq8();
++        std::lock_guard<std::mutex> lock(c.mutex);
++        c.scale[{src0->data, src0->ne[0], src0->ne[1], ctx.device}] = scale;
++    }
++    lf_blt_state & st = lf_blt();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    if (!st.handle) LF_BLT_CHECK(hipblasLtCreate(&st.handle));
++    lf_blt_gemm(ctx, st, src1, scale, w8.get(), (const float *) src1->data, (float *) dst->data, M, T, K);
++    CUDA_CHECK(cudaGetLastError());
++#else
++    GGML_UNUSED_VARS(ctx, src0, src1, dst);
++    GGML_ABORT("GGML_LF_KQ_BLAS=fp8 needs hipBLASLt");
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++bool ggml_cuda_lf_kq_blas_will_take(const ggml_tensor * mm) {
++    if (!lf_kq_on() || mm->op != GGML_OP_MUL_MAT) return false;
++    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return false;
++    if (!lf_kq_shape_ok(mm->src[0], mm->src[1])) return false;
++#if defined(GGML_LF_HIPBLASLT)
++    return lf_kq_probe(ggml_cuda_get_device()); // host-side query only; without kernels the fusions stay on
++#else
++    return false;
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++bool ggml_cuda_lf_kq_blas_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++#if defined(GGML_LF_HIPBLASLT)
++    if (!lf_kq_on()) return false;
++    if (dst->type != GGML_TYPE_F32 || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) return false;
++    if (!lf_kq_shape_ok(src0, src1)) return false;
++    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
++    const int64_t K = src0->ne[0], M = src0->ne[1];
++    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
++    if (src1->ne[0] != K || dst->ne[0] != M || ggml_nrows(dst) != T) return false;
++    if (lf_kq_mode() == 2) {
++        if (K % 4 != 0) return false;
++        if (!ggml_cuda_lf_kq_fp8_ready(src0, ctx.device, (int) M, (int) T, (int) K)) {
++            hipStreamCaptureStatus st = hipStreamCaptureStatusNone;   // first use allocates: not while a graph is being captured
++            if (hipStreamIsCapturing(ctx.stream(), &st) != hipSuccess || st != hipStreamCaptureStatusNone) return false;
++        }
++        return true;
++    }
++    if (!lf_kq_ready(ctx.device, ctx.stream(), lf_kq_chunk_rows((int) M, (int) K), (int) T, (int) K, (int) M)) {
++        // first use probes / allocates / tunes: not while a graph is being captured
++        hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
++        if (hipStreamIsCapturing(ctx.stream(), &st) != hipSuccess || st != hipStreamCaptureStatusNone) return false;
++        if (!lf_kq_probe(ctx.device)) return false;
++    }
++    return true;
++#else
++    GGML_UNUSED_VARS(ctx, src0, src1, dst);
++    return false;
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++void ggml_cuda_lf_kq_blas_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++#if defined(GGML_LF_HIPBLASLT)
++    if (lf_kq_mode() == 2) {
++        ggml_cuda_lf_kq_fp8_mul_mat(ctx, src0, src1, dst);
++        return;
++    }
++    cudaStream_t stream = ctx.stream();
++    const int K  = (int) src0->ne[0], M = (int) src0->ne[1];
++    const int T  = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    const int Mc = lf_kq_chunk_rows(M, K);
++    const float * x = (const float *) src1->data;
++    float * y = (float *) dst->data;
++
++    lf_kq_state & st = lf_kq();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    if (!st.handle) LF_KQ_CHECK(hipblasLtCreate(&st.handle));
++
++    lf_kq_scratch & sc = st.scratch[stream];
++    const size_t need = lf_kq_scratch_bytes(Mc, T, K, M);
++    if (sc.size < need) {
++        if (sc.ptr) {
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            CUDA_CHECK(cudaFree(sc.ptr));
++        }
++        CUDA_CHECK(cudaMalloc((void **) &sc.ptr, need));
++        sc.size  = need;
++        sc.x_src = nullptr;
++    }
++    half  * x16   = (half *) sc.ptr;
++    float * sx    = (float *) (sc.ptr + lf_kq_align((size_t) T * K * 2));
++    unsigned int * gbits = (unsigned int *) (sx + 16);
++    half  * w16   = (half *) ((char *) sx + LF_KQ_SCALE_BYTES);
++    float * av    = (float *) ((char *) w16 + lf_kq_align((size_t) Mc * K * 2));
++    char  * wsp   = (char *) av + lf_kq_align((size_t) M * 4);
++
++    // activations -> f16 with the batch scale, once per input and graph (GGML_LF_KQ_BLAS_SHARE=0: every call); alpha vector
++    static const bool share = !getenv("GGML_LF_KQ_BLAS_SHARE") || atoi(getenv("GGML_LF_KQ_BLAS_SHARE")) != 0;
++    const ggml_tensor * x_src = src1;
++    while (x_src->view_src != nullptr) x_src = x_src->view_src;
++    const uint64_t gen = g_lf_kq_graph_gen.load(std::memory_order_relaxed);
++    if (!share || sc.x_src != x_src || sc.x_data != src1->data || sc.x_T != T || sc.x_K != K || sc.x_gen != gen) {
++        CUDA_CHECK(cudaMemsetAsync(gbits, 0, sizeof(unsigned int), stream));
++        lf_kq_act_amax<<<T, 256, 0, stream>>>(x, K, gbits);
++        lf_kq_act_f16<<<T, 256, 0, stream>>>(x, x16, gbits, sx, K);
++        sc.x_src = x_src; sc.x_data = src1->data; sc.x_T = T; sc.x_K = K; sc.x_gen = gen;
++    }
++    lf_kq_alpha<<<(M + 255) / 256, 256, 0, stream>>>(sx, av, M);
++
++    lf_kq_algos_init(st, ctx.device);
++    const float beta = 0.f;
++
++    // descriptor + layouts for (rows per call, exact T): rows r0.. of dst, leading dimension M
++    auto layout = [&](const int mc, const int t) -> lf_kq_layout & {
++        lf_kq_layout & l = st.layouts[{ctx.device, mc, t, K, M}];
++        if (l.desc == nullptr) {
++            LF_KQ_CHECK(hipblasLtMatmulDescCreate(&l.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
++            const hipblasOperation_t ta = HIPBLAS_OP_T, tb = HIPBLAS_OP_N;
++            const hipblasLtPointerMode_t pm = HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST;
++            LF_KQ_CHECK(hipblasLtMatmulDescSetAttribute(l.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
++            LF_KQ_CHECK(hipblasLtMatmulDescSetAttribute(l.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
++            LF_KQ_CHECK(hipblasLtMatmulDescSetAttribute(l.desc, HIPBLASLT_MATMUL_DESC_POINTER_MODE, &pm, sizeof(pm)));
++            LF_KQ_CHECK(hipblasLtMatrixLayoutCreate(&l.la, HIP_R_16F, K, mc, K));
++            LF_KQ_CHECK(hipblasLtMatrixLayoutCreate(&l.lb, HIP_R_16F, K, t, K));
++            LF_KQ_CHECK(hipblasLtMatrixLayoutCreate(&l.lc, HIP_R_32F, mc, t, M));
++        }
++        return l;
++    };
++    auto supported = [&](lf_kq_layout & l, hipblasLtMatmulAlgo_t & algo, size_t & ws) {
++        return hipblaslt_ext::matmulIsAlgoSupported(st.handle, l.desc, av, l.la, l.lb, &beta, l.lc, l.lc, algo, ws) == HIPBLAS_STATUS_SUCCESS &&
++            ws <= LF_KQ_WS_MAX;
++    };
++    // the heuristic's candidates for (rows per call, t columns)
++    auto heuristic = [&](lf_kq_layout & l, hipblasLtMatmulHeuristicResult_t * res, const int nmax) {
++        hipblasLtMatmulPreference_t pref;
++        LF_KQ_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
++        LF_KQ_CHECK(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &LF_KQ_WS_MAX, sizeof(LF_KQ_WS_MAX)));
++        int nres = 0;
++        LF_KQ_CHECK(hipblasLtMatmulAlgoGetHeuristic(st.handle, l.desc, l.la, l.lb, l.lc, l.lc, pref, nmax, res, &nres));
++        hipblasLtMatmulPreferenceDestroy(pref);
++        return nres;
++    };
++    // the algorithm of bucket b (tb = b * 256 <= T columns): from the given table (GGML_LF_KQ_BLAS_ALGOS), else the
++    // heuristic's first candidate (with a table, or GGML_LF_KQ_BLAS_TUNE=0), else the fastest candidate timed on the
++    // first tb columns of the real operands
++    auto choose = [&](const int mc, const int r0, const int b) -> lf_kq_algo & {
++        lf_kq_algo & a = st.bucket[{ctx.device, mc, b, K, M}];
++        if (a.ok) return a;
++        const int tb = b * LF_KQ_BUCKET;
++        lf_kq_layout & l = layout(mc, tb);
++        const char * how = "table";
++        float best = 0.f;
++        if (st.algos_use) {
++            auto it = st.table.find({mc, b, K, M});
++            if (it != st.table.end()) {
++                std::vector<int> idx{it->second};
++                std::vector<hipblasLtMatmulHeuristicResult_t> hr;
++                if (hipblaslt_ext::getAlgosFromIndex(st.handle, idx, hr) == HIPBLAS_STATUS_SUCCESS && !hr.empty() && supported(l, hr[0].algo, a.ws)) {
++                    a.algo = hr[0].algo;
++                    a.ok   = true;
++                } else {
++                    fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS: choice %d for (%d rows, K %d, %d tokens) not usable here, heuristic used\n",
++                            it->second, mc, K, tb);
++                }
++            } else if (!st.algos_missing_warned && !st.table.empty()) {
++                st.algos_missing_warned = true;
++                fprintf(stderr, "GGML_LF_KQ_BLAS_ALGOS: no choice for (%d rows, K %d, %d tokens) and possibly others (other model / -ub?), "
++                                "heuristic used\n", mc, K, tb);
++            }
++        }
++        if (!a.ok) {
++            const bool timed = lf_kq_timed();
++            hipblasLtMatmulHeuristicResult_t res[32];
++            const int nres = heuristic(l, res, (timed || st.def_mode) ? 32 : 1);
++            if (nres == 0) GGML_ABORT("hipBLASLt has no f16 algorithm for M=%d N=%d K=%d", mc, tb, K);
++            // position in the gfx1201 priority list; unlisted candidates after the listed ones, in the heuristic's order
++            auto rank_of = [&](const int i) {
++                auto it = st.prio.find(hipblaslt_ext::getIndexFromAlgo(res[i].algo));
++                return it == st.prio.end() ? 100000 + i : it->second;
++            };
++            int bi = 0;
++            how = "heuristic";
++            if (st.def_mode) {
++                how = "gfx1201v1";
++                bi = -1;
++                for (int i = 0; i < nres; ++i) {
++                    if (res[i].workspaceSize <= LF_KQ_WS_MAX && (bi < 0 || rank_of(i) < rank_of(bi))) bi = i;
++                }
++                if (bi < 0) bi = 0;
++            } else if (timed) {
++                how = "timed";
++                hipEvent_t e0, e1;
++                CUDA_CHECK(hipEventCreate(&e0)); CUDA_CHECK(hipEventCreate(&e1));
++                // Timing on fixed pseudo-random activations (the real ones are restored below): one untimed run per
++                // candidate, then 5 rounds that time every candidate once in turn (slow clock drift hits all alike), each
++                // candidate's fastest run; tiny GEMMs (tens of us) repeat per sample.  Several candidates are usually within
++                // noise of each other and some of them round differently, so the choice is the first in the gfx1201 priority
++                // list (else the heuristic's ranking) among those within 3% of the fastest: near-ties resolve the same way
++                // every time.
++                lf_kq_fill_rand<<<1024, 256, 0, stream>>>(x16, (int64_t) tb * K);
++                auto run1 = [&](const int i) {
++                    return hipblasLtMatmul(st.handle, l.desc, av + r0, w16, l.la, x16, l.lb, &beta, y + r0, l.lc, y + r0, l.lc,
++                                           &res[i].algo, wsp, res[i].workspaceSize, stream) == HIPBLAS_STATUS_SUCCESS;
++                };
++                const double flop  = 2.0 * mc * tb * (double) K;
++                const int    iters = (int) std::min(32.0, std::max(1.0, std::ceil(4e9 / flop)));
++                std::vector<float> tms(nres, 1e30f);
++                std::vector<bool> usable(nres);
++                for (int i = 0; i < nres; ++i) {
++                    usable[i] = res[i].workspaceSize <= LF_KQ_WS_MAX && run1(i);
++                }
++                CUDA_CHECK(hipStreamSynchronize(stream));
++                for (int round = 0; round < 5; ++round) {
++                    for (int i = 0; i < nres; ++i) {
++                        if (!usable[i]) continue;
++                        CUDA_CHECK(hipEventRecord(e0, stream));
++                        for (int it = 0; it < iters && usable[i]; ++it) usable[i] = run1(i);
++                        CUDA_CHECK(hipEventRecord(e1, stream));
++                        CUDA_CHECK(hipEventSynchronize(e1));
++                        float ms = 0.f; CUDA_CHECK(hipEventElapsedTime(&ms, e0, e1));
++                        if (usable[i]) tms[i] = std::min(tms[i], ms / iters);
++                    }
++                }
++                CUDA_CHECK(hipEventDestroy(e0)); CUDA_CHECK(hipEventDestroy(e1));
++                lf_kq_act_f16<<<T, 256, 0, stream>>>(x, x16, gbits, sx, K); // the real activations back
++                best = 1e30f; bi = -1;
++                for (int i = 0; i < nres; ++i) {
++                    if (usable[i]) best = std::min(best, tms[i]);
++                }
++                for (int i = 0; i < nres; ++i) {
++                    if (usable[i] && tms[i] <= best * 1.03f && (bi < 0 || rank_of(i) < rank_of(bi))) bi = i;
++                }
++                if (lf_kq_log() >= 2) {
++                    std::string line;
++                    for (int i = 0; i < nres; ++i) {
++                        line += " " + std::to_string(hipblaslt_ext::getIndexFromAlgo(res[i].algo)) + ":" +
++                                (usable[i] ? std::to_string((int) (tms[i] * 1000.f)) : std::string("x"));
++                    }
++                    fprintf(stderr, "LF_KQ_BLAS cand rows %d N %d K %d M %d:%s\n", mc, tb, K, M, line.c_str());
++                }
++                if (bi < 0) GGML_ABORT("hipBLASLt: no f16 candidate ran for M=%d N=%d K=%d", mc, tb, K);
++                best = tms[bi];
++                // the timing runs left another candidate's result in y; the real call follows, so nothing to redo
++            }
++            a.algo = res[bi].algo;
++            a.ws   = res[bi].workspaceSize;
++            a.ok   = true;
++        }
++        a.idx = hipblaslt_ext::getIndexFromAlgo(a.algo);
++        if (lf_kq_log()) fprintf(stderr, "LF_KQ_BLAS f16 %s M=%d (rows %d per call) N=%d.. K=%d: %s, index %d%s\n",
++                                 ggml_type_name(src0->type), M, mc, tb, K, how, a.idx,
++                                 best > 0.f ? (" (" + std::to_string((int) (best * 1000.f)) + " us)").c_str() : "");
++        return a;
++    };
++    // the algorithm for this exact T: its bucket's choice, checked for T (heuristic's first candidate if unsupported)
++    auto resolve = [&](const int mc, const int r0) -> lf_kq_algo & {
++        lf_kq_algo & r = st.resolved[{ctx.device, mc, T, K, M}];
++        if (r.ok) return r;
++        const int b = T / LF_KQ_BUCKET;
++        { // the buckets below this one too, so the startup warm-up covers them all
++            for (int bb = std::max(1, (lf_kq_min_t() + LF_KQ_BUCKET - 1) / LF_KQ_BUCKET); bb < b; ++bb) {
++                choose(mc, r0, bb);
++            }
++        }
++        lf_kq_algo & a = choose(mc, r0, b);
++        lf_kq_layout & l = layout(mc, T);
++        r.algo = a.algo;
++        if (!supported(l, r.algo, r.ws)) {
++            hipblasLtMatmulHeuristicResult_t res[1];
++            if (heuristic(l, res, 1) == 0) GGML_ABORT("hipBLASLt has no f16 algorithm for M=%d N=%d K=%d", mc, T, K);
++            r.algo = res[0].algo;
++            r.ws   = res[0].workspaceSize;
++            if (lf_kq_log()) fprintf(stderr, "LF_KQ_BLAS f16 rows %d N=%d K=%d: bucket choice unsupported, heuristic used\n", mc, T, K);
++        }
++        r.ok = true;
++        return r;
++    };
++
++    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
++    for (int r0 = 0; r0 < M; r0 += Mc) {
++        const int mc = std::min(Mc, M - r0);
++        // weight rows r0 .. r0+mc -> f16 (whole quant blocks: K is a multiple of 64)
++        to_fp16((const char *) src0->data + (size_t) r0 * src0->nb[1], w16, (int64_t) mc * K, stream);
++        lf_kq_algo & r = resolve(mc, r0);
++        lf_kq_layout & l = layout(mc, T);
++        LF_KQ_CHECK(hipblasLtMatmul(st.handle, l.desc, av + r0, w16, l.la, x16, l.lb, &beta, y + r0, l.lc, y + r0, l.lc,
++                                    &r.algo, wsp, r.ws, stream));
++    }
++    CUDA_CHECK(cudaGetLastError());
++#else
++    GGML_UNUSED_VARS(ctx, src0, src1, dst);
++    GGML_ABORT("GGML_LF_KQ_BLAS needs hipBLASLt");
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++void ggml_cuda_lf_kq_blas_graph_begin() {
++#if defined(GGML_LF_HIPBLASLT)
++    g_lf_kq_graph_gen.fetch_add(1, std::memory_order_relaxed);
++    g_lf_fp8_graph_gen.fetch_add(1, std::memory_order_relaxed);
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++// Startup warm-up hooks (reached by llama-common through ggml_backend_reg_get_proc_address): whether the warm-up should
++// run a full ubatch (always when K1 is on: choices made and kernels loaded before the first prompt), and the resulting
++// table for GGML_LF_KQ_BLAS_ALGOS ("" if none).
++bool ggml_cuda_lf_kq_blas_wants_warmup() {
++#if defined(GGML_LF_HIPBLASLT)
++    // also reports the state at startup (hipBLASLt found, selection mode) instead of at the first long prompt
++    if (!lf_kq_on()) return false;
++    const int device = ggml_cuda_get_device();
++    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) || !lf_kq_probe(device)) return false;
++    {
++        lf_kq_state & st = lf_kq();
++        std::lock_guard<std::mutex> lock(st.mutex);
++        lf_kq_algos_init(st, device);
++    }
++    // every mode: the warm-up makes the choices and loads hipBLASLt's kernels (their code objects are loaded on first
++    // use, which otherwise lands in the first prompt: -3% at 30K), and prints the choices as a table
++    return true;
++#else
++    return false;
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++const char * ggml_cuda_lf_kq_blas_algos_string() {
++#if defined(GGML_LF_HIPBLASLT)
++    static std::string out;
++    lf_kq_state & st = lf_kq();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    out = st.handle ? lf_kq_algos_export(st, ggml_cuda_get_device()) : std::string();
++    return out.c_str();
++#else
++    return "";
++#endif // defined(GGML_LF_HIPBLASLT)
++}
+diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cuh b/ggml/src/ggml-cuda/lf-kq-blas.cuh
+new file mode 100644
+index 000000000..892d4795d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lf-kq-blas.cuh
+@@ -0,0 +1,31 @@
++#pragma once
++#include "common.cuh"
++// Llama-Frankenstein K1 (written by Claude): prefill GEMM of quantized weights as f16 through hipBLASLt (RDNA4).
++// GGML_LF_KQ_BLAS=f16 turns it on (unset: off, nothing changes); GGML_LF_KQ_BLAS_ALGOS selects how algorithms are
++// chosen (unset: def.gfx1201v1 on gfx1201, else tune; "def.gfx1201v1", the built-in gfx1201 priority list; a printed
++// "K1a2." table; "tune", timed by the startup warm-up; "0" or anything else: hipBLASLt's first heuristic choice).  It takes dense MUL_MATs with at least
++// GGML_LF_KQ_BLAS_MIN_T tokens (default 1024, i.e. prompt processing with -ub >= 1024; the per-call weight
++// conversion does not pay off at -ub 512).  Matmuls of one graph with the same input
++// convert it once (GGML_LF_KQ_BLAS_SHARE=0: every call; same results either way).  GGML_LF_KQ_BLAS_LOG=1 prints the algorithm chosen per shape.
++// The weight is dequantized to f16 (to_fp16: one rounding of the block value), the activations go to f16 with one
++// power-of-two scale for the batch (exact scaling), and hipBLASLt multiplies f16 x f16 with f32 accumulation; the
++// batch scale is the per-row alpha vector.  Results differ from mmq (which rounds the activations to int8 per 32);
++// measured on gfx1201 / Qwen3.8-27B Q5_K_M: KLD 1.0..1.2x the one-bit f16 floor, pp2048 +26% (depth 0) / +15% (32K)
++// at -ub 2048.  Decode and speculative verify (<= 8 tokens) never reach it.
++bool ggml_cuda_lf_kq_blas_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++void ggml_cuda_lf_kq_blas_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++// The dense gate+up fusions (GLU and the mmq pair) stand down for the matmuls this path will take.
++bool ggml_cuda_lf_kq_blas_will_take(const ggml_tensor * mm);
++// Called at every graph start: the f16 input conversions shared by matmuls of one graph expire.
++void ggml_cuda_lf_kq_blas_graph_begin();
++// Startup warm-up hooks, exported as ggml_backend_lf_kq_blas_wants_warmup / ggml_backend_lf_kq_blas_algos.
++bool         ggml_cuda_lf_kq_blas_wants_warmup();
++const char * ggml_cuda_lf_kq_blas_algos_string();
++
++// K1 v2: GGML_LF_KQ_BLAS=fp8 (lossy) rounds the quantized weight to fp8 e4m3 per row (row amax / 448, cached per tensor) and the
++// activations to fp8 with one scale per batch, then multiplies with hipBLASLt's fp8 GEMM (algorithm: the built-in gfx1201 fp8
++// priority list).  The fp8 GEMM is shared with M4 (MXFP4 weights, lf-mxfp4.cu):
++//   y[M][T] = av[m] * sx * (w8[m] . xq[t]), w8 fp8 [M][K] row-major, the fp8 activations converted from src1 once per input and graph
++bool ggml_cuda_lf_fp8_gemm_ready(int M, int T, int K);
++void ggml_cuda_lf_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const float * av, const uint8_t * w8, float * y,
++                           int M, int T, int K);
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 6f8014bac..33280059c 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -168,3 +168,16 @@ if (GGML_HIP_RCCL)
+ endif()
+ 
+ target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
++
++# Llama-Frankenstein K1: hipBLASLt for the f16 prefill GEMM (GGML_LF_KQ_BLAS=f16); without it the path is compiled out
++option(GGML_HIP_LF_HIPBLASLT "ggml: link hipBLASLt for the LF K1 f16 prefill GEMM" ON)
++if (GGML_HIP_LF_HIPBLASLT)
++    find_package(hipblaslt QUIET)
++    if (hipblaslt_FOUND)
++        target_link_libraries(ggml-hip PRIVATE roc::hipblaslt)
++        target_compile_definitions(ggml-hip PRIVATE GGML_LF_HIPBLASLT)
++        message(STATUS "LF K1: hipBLASLt found, GGML_LF_KQ_BLAS available")
++    else()
++        message(STATUS "LF K1: hipBLASLt not found, GGML_LF_KQ_BLAS compiled out")
++    endif()
++endif()

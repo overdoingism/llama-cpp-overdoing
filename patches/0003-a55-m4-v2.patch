@@ -1,0 +1,863 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6f68b7895..db68916d9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -21,6 +21,7 @@
+ #include "ggml-cuda/conv3d.cuh"
+ #include "ggml-cuda/convert.cuh"
+ #include "ggml-cuda/lf-kq-blas.cuh"   // Llama-Frankenstein K1
++#include "ggml-cuda/lf-mxfp4.cuh"     // Llama-Frankenstein M4
+ #include "ggml-cuda/count-equal.cuh"
+ #include "ggml-cuda/cpy.cuh"
+ #include "ggml-cuda/cross-entropy-loss.cuh"
+@@ -2341,7 +2342,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+     }
+ 
+     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes these matmuls unfused
+-    if (is_mul_mat && ggml_cuda_lf_kq_blas_will_take(ffn_up)) {
++    if (is_mul_mat && (ggml_cuda_lf_kq_blas_will_take(ffn_up) || ggml_cuda_lf_mxfp4_will_take(ffn_up))) {
+         return false;
+     }
+ 
+@@ -2534,6 +2535,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_lf_kq_blas_mul_mat(ctx, src0, src1, dst);
+         return;
+     }
++    // Llama-Frankenstein M4: MXFP4 direct path for prefill (GGML_LF_MXFP4_DIRECT=blaslt|fp8|f16, off by default; see lf-mxfp4.cuh)
++    if (ggml_cuda_lf_mxfp4_supported(ctx, src0, src1, dst)) {
++        ggml_cuda_lf_mxfp4_mul_mat(ctx, src0, src1, dst);
++        return;
++    }
+ 
+     // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
+     // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
+@@ -4885,7 +4891,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
+             : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
+     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes dense pairs unfused
+-    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && ggml_cuda_lf_kq_blas_will_take(node);
++    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && (ggml_cuda_lf_kq_blas_will_take(node) || ggml_cuda_lf_mxfp4_will_take(node));
+     if (!pair_off && !mmb_pair_taken && !lf_kq_pair_taken && (node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) && i + 1 < cgraph->n_nodes) {
+         ggml_tensor * next = cgraph->nodes[i + 1];
+         const ggml_tensor * src0 = node->src[0];
+@@ -5112,7 +5118,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
+             a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
+         // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes the down projection unfused
+-        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) &&
++        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) && !ggml_cuda_lf_mxfp4_will_take(next) &&
+                 ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
+                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+             ggml_cuda_mul_mat_q_swiglu_dense(*cuda_ctx, next->src[0], next, node);
+@@ -7217,6 +7223,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     // The Q8_1 input cache is only valid within one graph execution.
+     cuda_ctx->q8_1_cache_clear();
+     ggml_cuda_lf_kq_blas_graph_begin();
++    ggml_cuda_lf_mxfp4_graph_begin();
+     ggml_cuda_mmb_set_active_ctx(cuda_ctx);
+     ggml_cuda_mmb_begin_graph();
+ 
+diff --git a/ggml/src/ggml-cuda/lf-mxfp4.cu b/ggml/src/ggml-cuda/lf-mxfp4.cu
+new file mode 100644
+index 000000000..29a8c9963
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lf-mxfp4.cu
+@@ -0,0 +1,771 @@
++#include "lf-mxfp4.cuh"
++#include "lf-kq-blas.cuh"
++#include "convert.cuh"
++
++#ifndef LF_MX_ABL
++#define LF_MX_ABL 0 // diagnostic ablations of the fp8 GEMM (0 = normal)
++#endif
++
++#include <cstring>
++#include <mutex>
++#include <tuple>
++#include <map>
++#include <vector>
++#include <algorithm>
++#include <atomic>
++
++#if defined(GGML_LF_HIPBLASLT)
++#include <hipblaslt/hipblaslt.h>
++#include <hipblaslt/hipblaslt-ext.hpp>
++#endif // defined(GGML_LF_HIPBLASLT)
++
++// Layout notes (gfx12 WMMA 16x16x16, wave32): operand lane l holds row l%16, k = (l/16)*8 .. +7; result element
++// (v, lane) is row v + 8*(lane/16), column lane%16.  The WMMA computes D = X * W^T (A operand = activations), so the
++// result columns are weight rows and the stores to dst (row = token, contiguous in the weight row) coalesce.
++
++namespace {
++
++constexpr int LF_QK   = 32;  // MXFP4 block
++constexpr int LF_BS   = 17;  // sizeof(block_mxfp4): e8m0 scale + 16 bytes of nibbles
++constexpr int LF_BK8  = 64;  // fp8: k per stage
++constexpr int LF_LDS8 = LF_BK8 + 8;
++constexpr int LF_BK16 = 32;  // f16: k per stage (64 bytes per row, like the fp8 kernel)
++constexpr int LF_LDS16 = LF_BK16 * 2 + 16;
++// per-row power-of-two shift = emax - LF_SHIFT_*: fp8 puts the row's largest block at 12 * 2^5 = 384 <= 448,
++// f16 at 12 * 2^12 = 49152 <= 65504
++constexpr int LF_SHIFT8  = 133;
++constexpr int LF_SHIFT16 = 140;
++
++int lf_mode() { // 0 off, 1 fp8, 2 f16, 3 blaslt (MXFP4 -> fp8 copy + hipBLASLt fp8 GEMM)
++    static const int mode = [] {
++        const char * s = getenv("GGML_LF_MXFP4_DIRECT");
++        if (s == nullptr) return 0;
++        if (strcmp(s, "fp8") == 0) return 1;
++        if (strcmp(s, "f16") == 0) return 2;
++#if defined(GGML_LF_HIPBLASLT)
++        if (strcmp(s, "blaslt") == 0) return 3;
++#endif // defined(GGML_LF_HIPBLASLT)
++        GGML_LOG_WARN("GGML_LF_MXFP4_DIRECT=%s not recognized (fp8 | f16 | blaslt), direct path off\n", s);
++        return 0;
++    }();
++    return mode;
++}
++int lf_min_t() { static const int t = getenv("GGML_LF_MXFP4_MIN_T") ? atoi(getenv("GGML_LF_MXFP4_MIN_T")) : 64; return t; }
++int lf_log()   { static const int l = getenv("GGML_LF_MXFP4_LOG")   ? atoi(getenv("GGML_LF_MXFP4_LOG"))   : 0;  return l; }
++
++typedef int      lf_v2i __attribute__((ext_vector_type(2)));
++typedef float    lf_v8f __attribute__((ext_vector_type(8)));
++typedef _Float16 lf_v8h __attribute__((ext_vector_type(8)));
++
++// ------------------------------------------------------------------------------------------------ device helpers
++#if defined(RDNA4)
++// one block_mxfp4 at byte offset o of a 4-byte aligned base: aligned dword loads, then byte-shifted into place
++static __device__ __forceinline__ void lf_load_block(const uint8_t * __restrict__ base, const size_t o, int & e, uint4 & qs) {
++    const uint32_t * p = (const uint32_t *) (base + (o & ~(size_t) 3));
++    const int s = (int) (o & 3);
++    uint32_t d[5];
++#pragma unroll
++    for (int i = 0; i < 5; ++i) d[i] = p[i];
++    e = (int) ((d[0] >> (8 * s)) & 0xFF);
++    const int sh = 8 * (s + 1); // 8..32
++    uint32_t q[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) q[j] = (uint32_t) ((((uint64_t) d[j + 1] << 32) | d[j]) >> sh);
++    qs = make_uint4(q[0], q[1], q[2], q[3]);
++}
++
++// fp8 e4m3 table for one block: entry i = fp8(|kvalues_mxfp4[i]| * 2^delta); entries 0..3 -> t_lo, 4..7 -> t_hi
++static __device__ __forceinline__ void lf_table_fp8(const int delta, int & t_lo, int & t_hi) {
++    const float s = __builtin_ldexpf(1.0f, delta);
++    t_lo = __builtin_amdgcn_cvt_pk_fp8_f32(0.f,      1.f * s, 0,    false);
++    t_lo = __builtin_amdgcn_cvt_pk_fp8_f32(2.f * s,  3.f * s, t_lo, true);
++    t_hi = __builtin_amdgcn_cvt_pk_fp8_f32(4.f * s,  6.f * s, 0,    false);
++    t_hi = __builtin_amdgcn_cvt_pk_fp8_f32(8.f * s, 12.f * s, t_hi, true);
++}
++
++// f16 table: a normal f16 of kv * 2^delta has a zero low byte (kv has <= 2 mantissa bits), so only the high bytes
++static __device__ __forceinline__ void lf_table_f16(const int delta, int & t_lo, int & t_hi) {
++    const float s = __builtin_ldexpf(1.0f, delta);
++    const uint32_t d0 = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(0.f,     1.f * s));
++    const uint32_t d1 = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(2.f * s, 3.f * s));
++    const uint32_t d2 = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(4.f * s, 6.f * s));
++    const uint32_t d3 = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(8.f * s, 12.f * s));
++    t_lo = (int) __builtin_amdgcn_perm(d1, d0, 0x07050301u);
++    t_hi = (int) __builtin_amdgcn_perm(d3, d2, 0x07050301u);
++}
++
++// 4 nibbles (low nibble of each byte; bit 3 = sign) -> 4 table bytes with the sign in bit 7
++static __device__ __forceinline__ uint32_t lf_lookup4(const int nib, const int t_lo, const int t_hi) {
++    const int sel  = nib & 0x07070707;
++    const int sign = (nib & 0x08080808) << 4;
++    return __builtin_amdgcn_perm((uint32_t) t_hi, (uint32_t) t_lo, (uint32_t) sel) | (uint32_t) sign;
++}
++#endif // defined(RDNA4)
++
++// ------------------------------------------------------------------------------------------------ kernels
++__global__ void lf_row_emax(const uint8_t * __restrict__ w, const size_t nb01, const int nblk,
++        uint8_t * __restrict__ emax, unsigned int * __restrict__ lost) {
++    const uint8_t * r = w + blockIdx.x * nb01;
++    int m = 0;
++    for (int b = threadIdx.x; b < nblk; b += blockDim.x) m = max(m, (int) r[(size_t) b * LF_BS]);
++    __shared__ int red[256];
++    red[threadIdx.x] = m;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] = max(red[threadIdx.x], red[threadIdx.x + s]);
++        __syncthreads();
++    }
++    m = red[0];
++    if (threadIdx.x == 0) emax[blockIdx.x] = (uint8_t) m;
++    if (lost == nullptr) return;
++    // blocks whose smallest nonzero magnitude falls below the exact range (fp8: delta < -9, f16: delta < -14)
++    unsigned int l8 = 0, l16 = 0;
++    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
++        const int E = r[(size_t) b * LF_BS];
++        l8  += E - m + (LF_SHIFT8  - 128) < -9;
++        l16 += E - m + (LF_SHIFT16 - 128) < -14;
++    }
++    if (l8)  atomicAdd(&lost[0], l8);
++    if (l16) atomicAdd(&lost[1], l16);
++}
++
++__global__ void lf_quant_act_fp8(const float * __restrict__ x, uint8_t * __restrict__ xq, float * __restrict__ xs, const int K) {
++#if defined(RDNA4)
++    const int n = blockIdx.x;
++    const float * row = x + (size_t) n * K;
++    float amax = 0.f;
++    for (int k = threadIdx.x; k < K; k += blockDim.x) amax = fmaxf(amax, fabsf(row[k]));
++    __shared__ float red[256];
++    red[threadIdx.x] = amax;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
++        __syncthreads();
++    }
++    amax = red[0];
++    const float scale = amax > 0.f ? amax / 448.f : 1.f;
++    const float inv   = amax > 0.f ? 448.f / amax : 0.f;
++    for (int k = 4 * threadIdx.x; k < K; k += 4 * blockDim.x) {
++        const float4 v = *(const float4 *) (row + k);
++        int w = __builtin_amdgcn_cvt_pk_fp8_f32(v.x * inv, v.y * inv, 0, false);
++        w     = __builtin_amdgcn_cvt_pk_fp8_f32(v.z * inv, v.w * inv, w, true);
++        *(int *) (xq + (size_t) n * K + k) = w;
++    }
++    if (threadIdx.x == 0) xs[n] = scale;
++#else
++    GGML_UNUSED_VARS(x, xq, xs, K);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// f16 with one power-of-two scale per token (amax / scale < 2^15): exact scaling, f16 rounding only
++__global__ void lf_quant_act_f16(const float * __restrict__ x, _Float16 * __restrict__ xh, float * __restrict__ xs, const int K) {
++    const int n = blockIdx.x;
++    const float * row = x + (size_t) n * K;
++    float amax = 0.f;
++    for (int k = threadIdx.x; k < K; k += blockDim.x) amax = fmaxf(amax, fabsf(row[k]));
++    __shared__ float red[256];
++    red[threadIdx.x] = amax;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
++        __syncthreads();
++    }
++    amax = red[0];
++    int e = 0;
++    frexpf(amax, &e); // amax < 2^e
++    const float scale = amax > 0.f ? ldexpf(1.f, e - 15) : 1.f;
++    const float inv   = amax > 0.f ? ldexpf(1.f, 15 - e) : 0.f;
++    for (int k = 2 * threadIdx.x; k < K; k += 2 * blockDim.x) {
++        const float2 v = *(const float2 *) (row + k);
++        xh[(size_t) n * K + k + 0] = (_Float16) (v.x * inv);
++        xh[(size_t) n * K + k + 1] = (_Float16) (v.y * inv);
++    }
++    if (threadIdx.x == 0) xs[n] = scale;
++}
++
++// Y[n][m] = xs[n] * 2^shift[m] * sum_k Wfp8[m][k] * Xfp8[n][k].  Block = WM x WN waves, each TM x TN 16x16 tiles.
++template <int WM, int WN, int TM, int TN, int BK = 64>
++__global__ void __launch_bounds__(WM * WN * 32, 1) lf_gemm_fp8(
++        const uint8_t * __restrict__ w, const size_t nb01, const uint8_t * __restrict__ emax,
++        const uint8_t * __restrict__ xq, const float * __restrict__ xs, float * __restrict__ y,
++        const int M, const int N, const int K, const int nst_per) {
++#if defined(RDNA4)
++    constexpr int NT    = WM * WN * 32;
++    constexpr int LDSS  = BK + 8;       // LDS bytes per row
++    constexpr int BMt   = WM * TM * 16, BNt = WN * TN * 16;
++    constexpr int A_BLK = BMt * (BK / LF_QK);
++    constexpr int A_PER = (A_BLK + NT - 1) / NT;
++    constexpr int B_CH  = BNt * (BK / 16);
++    constexpr int B_PER = (B_CH + NT - 1) / NT;
++    __shared__ __attribute__((aligned(16))) uint8_t As[2][BMt * LDSS];
++    __shared__ __attribute__((aligned(16))) uint8_t Bs[2][BNt * LDSS];
++    const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
++    // blockIdx.x walks the token (N) tiles: the blocks sharing a weight tile run together, so the weights stream from
++    // DRAM once and the other N tiles hit L2
++    const int m0 = blockIdx.y * BMt, n0 = blockIdx.x * BNt;
++    const int wave_m = wave % WM, wave_n = wave / WM;
++
++    int ra_off[A_PER]; size_t ra_base[A_PER];   // per-thread weight rows are fixed across stages
++#pragma unroll
++    for (int i = 0; i < A_PER; ++i) {
++        const int c = tid + i * NT, r = min(m0 + c / (BK / LF_QK), M - 1);
++        ra_base[i] = (size_t) r * nb01 + (size_t) (c % (BK / LF_QK)) * LF_BS;
++        ra_off[i]  = (LF_SHIFT8 - 128) - (int) emax[r];
++    }
++
++    uint4 qa[A_PER]; int ea[A_PER]; uint4 xb[B_PER];
++    auto gloadA = [&](const int kb) {
++#pragma unroll
++        for (int i = 0; i < A_PER; ++i) {
++            if (A_BLK % NT == 0 || tid + i * NT < A_BLK) {
++#if LF_MX_ABL == 2 // diagnostic: no weight loads
++                qa[i] = make_uint4(ra_base[i] + kb, 0x12345678u, 0x9abcdef0u, (unsigned) kb); ea[i] = (int) (ra_base[i] & 7);
++#else
++                lf_load_block(w, ra_base[i] + (size_t) kb * (BK / LF_QK) * LF_BS, ea[i], qa[i]);
++#endif
++                ea[i] += ra_off[i];
++            }
++        }
++    };
++    auto gloadB = [&](const int kb, uint4 * dst) {
++#pragma unroll
++        for (int i = 0; i < B_PER; ++i) {
++            const int c = tid + i * NT;
++            if (B_CH % NT == 0 || c < B_CH) {
++                const int r = min(n0 + c / (BK / 16), N - 1), o = c % (BK / 16);
++#if LF_MX_ABL == 3 // diagnostic: no activation loads
++                dst[i] = make_uint4(r, o, kb, 0x38383838u);
++#else
++                dst[i] = *(const uint4 *) (xq + (size_t) r * K + kb * BK + o * 16);
++#endif
++            }
++        }
++    };
++    auto lstoreA = [&](const int buf) {
++#pragma unroll
++        for (int i = 0; i < A_PER; ++i) {
++            const int c = tid + i * NT;
++            if (A_BLK % NT == 0 || c < A_BLK) {
++                const int r = c / (BK / LF_QK), b = c % (BK / LF_QK);
++#if LF_MX_ABL == 1 // diagnostic: no conversion (raw bits)
++                const uint4 lo = qa[i], hi = make_uint4(qa[i].x ^ ea[i], qa[i].y, qa[i].z, qa[i].w);
++#else
++                int t_lo, t_hi;
++                lf_table_fp8(ea[i], t_lo, t_hi);
++                const int q[4] = {(int) qa[i].x, (int) qa[i].y, (int) qa[i].z, (int) qa[i].w};
++                uint4 lo, hi;
++                lo.x = lf_lookup4(q[0], t_lo, t_hi); hi.x = lf_lookup4(q[0] >> 4, t_lo, t_hi);
++                lo.y = lf_lookup4(q[1], t_lo, t_hi); hi.y = lf_lookup4(q[1] >> 4, t_lo, t_hi);
++                lo.z = lf_lookup4(q[2], t_lo, t_hi); hi.z = lf_lookup4(q[2] >> 4, t_lo, t_hi);
++                lo.w = lf_lookup4(q[3], t_lo, t_hi); hi.w = lf_lookup4(q[3] >> 4, t_lo, t_hi);
++#endif
++                uint8_t * pa = &As[buf][r * LDSS + b * LF_QK];
++                *(uint4 *) pa        = lo;
++                *(uint4 *) (pa + 16) = hi;
++            }
++        }
++    };
++    auto lstoreB = [&](const int buf, const uint4 * src) {
++#pragma unroll
++        for (int i = 0; i < B_PER; ++i) {
++            const int c = tid + i * NT;
++            if (B_CH % NT == 0 || c < B_CH) {
++                const int r = c / (BK / 16), o = c % (BK / 16);
++                *(uint4 *) &Bs[buf][r * LDSS + o * 16] = src[i];
++            }
++        }
++    };
++
++    lf_v8f acc[TM][TN];
++#pragma unroll
++    for (int i = 0; i < TM; ++i)
++#pragma unroll
++        for (int j = 0; j < TN; ++j) acc[i][j] = lf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
++
++    // split-K: blockIdx.z takes stages [s0, s0 + nst) and writes its own output slice (summed by lf_splitk_reduce)
++    const int s0  = blockIdx.z * nst_per;
++    const int nst = min(K / BK - s0, nst_per);
++    y += (size_t) blockIdx.z * N * M;
++    // activations are loaded two stages ahead (xb holds stage s+1 while stage s+2 is in flight), so storing them never
++    // waits on a load issued in the same round
++    gloadA(s0);
++    gloadB(s0, xb);
++    lstoreA(0);
++    lstoreB(0, xb);
++    gloadB(s0 + min(1, nst - 1), xb);
++    __syncthreads();
++    for (int s = 0; s < nst; ++s) {
++        const int buf = s & 1;
++        // unconditional prefetch (the last round reloads its own stage into the unused buffer): a conditional load
++        // makes the compiler wait for it early
++        gloadA(s0 + min(s + 1, nst - 1));
++        uint4 xn[B_PER];
++        gloadB(s0 + min(s + 2, nst - 1), xn);
++#pragma unroll
++        for (int ks = 0; ks < BK / 16; ++ks) {
++            const int kk = ks * 16 + (lane / 16) * 8;
++            lf_v2i a[TM], b[TN];
++#pragma unroll
++            for (int tm = 0; tm < TM; ++tm) a[tm] = *(const lf_v2i *) &As[buf][(wave_m * TM * 16 + tm * 16 + lane % 16) * LDSS + kk];
++#pragma unroll
++            for (int tn = 0; tn < TN; ++tn) b[tn] = *(const lf_v2i *) &Bs[buf][(wave_n * TN * 16 + tn * 16 + lane % 16) * LDSS + kk];
++#pragma unroll
++            for (int tm = 0; tm < TM; ++tm)
++#pragma unroll
++                for (int tn = 0; tn < TN; ++tn)
++#if LF_MX_ABL == 5 // diagnostic: no WMMA
++                    acc[tm][tn][0] += (float) (a[tm].x ^ b[tn].y);
++#else
++                    acc[tm][tn] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(b[tn], a[tm], acc[tm][tn]);
++#endif
++        }
++        // keep the next stage's LDS stores (and their global-load waits) after the compute: a compiler memory barrier
++        // stops the IR passes, sched_barrier the machine scheduler
++        asm volatile("" ::: "memory");
++        __builtin_amdgcn_sched_barrier(0);
++        lstoreA(buf ^ 1);
++        lstoreB(buf ^ 1, xb);
++#pragma unroll
++        for (int i = 0; i < B_PER; ++i) xb[i] = xn[i];
++#if LF_MX_ABL != 4 // diagnostic: 4 = no barrier in the loop
++        __syncthreads();
++#endif
++    }
++#pragma unroll
++    for (int tm = 0; tm < TM; ++tm) {
++        const int m = m0 + wave_m * TM * 16 + tm * 16 + lane % 16;
++        if (m >= M) continue;
++        const float rs = ldexpf(1.f, (int) emax[m] - LF_SHIFT8);
++#pragma unroll
++        for (int tn = 0; tn < TN; ++tn)
++#pragma unroll
++            for (int v = 0; v < 8; ++v) {
++                const int n = n0 + wave_n * TN * 16 + tn * 16 + v + 8 * (lane / 16);
++                if (n < N) y[(size_t) n * M + m] = acc[tm][tn][v] * xs[n] * rs;
++            }
++    }
++#else
++    GGML_UNUSED_VARS(w, nb01, emax, xq, xs, y, M, N, K, nst_per);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// sum of the split-K output slices, in a fixed order (deterministic)
++__global__ void lf_splitk_reduce(const float * __restrict__ part, float * __restrict__ y, const size_t n4, const int ks) {
++    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n4) return;
++    float4 a = ((const float4 *) part)[i];
++    for (int z = 1; z < ks; ++z) {
++        const float4 b = ((const float4 *) part)[(size_t) z * n4 + i];
++        a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
++    }
++    ((float4 *) y)[i] = a;
++}
++
++// f16 variant: MXFP4 -> f16 (exact for normal-range blocks), f16 activations, one MXFP4 block per row per stage
++template <int WM, int WN, int TM, int TN>
++__global__ void __launch_bounds__(WM * WN * 32, 1) lf_gemm_f16(
++        const uint8_t * __restrict__ w, const size_t nb01, const uint8_t * __restrict__ emax,
++        const _Float16 * __restrict__ xh, const float * __restrict__ xs, float * __restrict__ y,
++        const int M, const int N, const int K) {
++#if defined(RDNA4)
++    constexpr int NT    = WM * WN * 32;
++    constexpr int BMt   = WM * TM * 16, BNt = WN * TN * 16;
++    constexpr int ROWB  = LF_BK16 * 2;
++    constexpr int A_BLK = BMt * (LF_BK16 / LF_QK);
++    constexpr int A_PER = (A_BLK + NT - 1) / NT;
++    constexpr int B_CH  = BNt * (ROWB / 16);
++    constexpr int B_PER = (B_CH + NT - 1) / NT;
++    __shared__ __attribute__((aligned(16))) uint8_t As[2][BMt * LF_LDS16];
++    __shared__ __attribute__((aligned(16))) uint8_t Bs[2][BNt * LF_LDS16];
++    const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
++    const int m0 = blockIdx.x * BMt, n0 = blockIdx.y * BNt;
++    const int wave_m = wave % WM, wave_n = wave / WM;
++    const uint8_t * xhb = (const uint8_t *) xh;
++
++    int ra_off[A_PER]; size_t ra_base[A_PER];
++#pragma unroll
++    for (int i = 0; i < A_PER; ++i) {
++        const int c = tid + i * NT, r = min(m0 + c / (LF_BK16 / LF_QK), M - 1);
++        ra_base[i] = (size_t) r * nb01 + (size_t) (c % (LF_BK16 / LF_QK)) * LF_BS;
++        ra_off[i]  = (LF_SHIFT16 - 128) - (int) emax[r];
++    }
++
++    uint4 qa[A_PER]; int ea[A_PER]; uint4 xb[B_PER];
++    auto gload = [&](const int kb) {
++#pragma unroll
++        for (int i = 0; i < A_PER; ++i) {
++            if (A_BLK % NT == 0 || tid + i * NT < A_BLK) {
++                lf_load_block(w, ra_base[i] + (size_t) kb * (LF_BK16 / LF_QK) * LF_BS, ea[i], qa[i]);
++                ea[i] += ra_off[i];
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < B_PER; ++i) {
++            const int c = tid + i * NT;
++            if (B_CH % NT == 0 || c < B_CH) {
++                const int r = min(n0 + c / (ROWB / 16), N - 1), o = c % (ROWB / 16);
++                xb[i] = *(const uint4 *) (xhb + ((size_t) r * K + (size_t) kb * LF_BK16) * 2 + o * 16);
++            }
++        }
++    };
++    auto lstore = [&](const int buf) {
++#pragma unroll
++        for (int i = 0; i < A_PER; ++i) {
++            const int c = tid + i * NT;
++            if (A_BLK % NT == 0 || c < A_BLK) {
++                const int r = c / (LF_BK16 / LF_QK), b = c % (LF_BK16 / LF_QK);
++                int t_lo, t_hi;
++                lf_table_f16(ea[i], t_lo, t_hi);
++                const int q[4] = {(int) qa[i].x, (int) qa[i].y, (int) qa[i].z, (int) qa[i].w};
++                uint32_t lo[8], hi[8]; // elements 0..15 and 16..31 as f16 pairs (zero low bytes inserted)
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    const uint32_t hl = lf_lookup4(q[j], t_lo, t_hi), hh = lf_lookup4(q[j] >> 4, t_lo, t_hi);
++                    lo[2 * j] = __builtin_amdgcn_perm(0u, hl, 0x010C000Cu); lo[2 * j + 1] = __builtin_amdgcn_perm(0u, hl, 0x030C020Cu);
++                    hi[2 * j] = __builtin_amdgcn_perm(0u, hh, 0x010C000Cu); hi[2 * j + 1] = __builtin_amdgcn_perm(0u, hh, 0x030C020Cu);
++                }
++                uint8_t * pa = &As[buf][r * LF_LDS16 + b * 64];
++                *(uint4 *) (pa +  0) = make_uint4(lo[0], lo[1], lo[2], lo[3]);
++                *(uint4 *) (pa + 16) = make_uint4(lo[4], lo[5], lo[6], lo[7]);
++                *(uint4 *) (pa + 32) = make_uint4(hi[0], hi[1], hi[2], hi[3]);
++                *(uint4 *) (pa + 48) = make_uint4(hi[4], hi[5], hi[6], hi[7]);
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < B_PER; ++i) {
++            const int c = tid + i * NT;
++            if (B_CH % NT == 0 || c < B_CH) {
++                const int r = c / (ROWB / 16), o = c % (ROWB / 16);
++                *(uint4 *) &Bs[buf][r * LF_LDS16 + o * 16] = xb[i];
++            }
++        }
++    };
++
++    lf_v8f acc[TM][TN];
++#pragma unroll
++    for (int i = 0; i < TM; ++i)
++#pragma unroll
++        for (int j = 0; j < TN; ++j) acc[i][j] = lf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
++
++    const int nst = K / LF_BK16;
++    gload(0);
++    lstore(0);
++    __syncthreads();
++    for (int s = 0; s < nst; ++s) {
++        const int buf = s & 1;
++        if (s + 1 < nst) gload(s + 1);
++#pragma unroll
++        for (int ks = 0; ks < LF_BK16 / 16; ++ks) {
++            const int kb2 = (ks * 16 + (lane / 16) * 8) * 2;
++            lf_v8h a[TM], b[TN];
++#pragma unroll
++            for (int tm = 0; tm < TM; ++tm) a[tm] = *(const lf_v8h *) &As[buf][(wave_m * TM * 16 + tm * 16 + lane % 16) * LF_LDS16 + kb2];
++#pragma unroll
++            for (int tn = 0; tn < TN; ++tn) b[tn] = *(const lf_v8h *) &Bs[buf][(wave_n * TN * 16 + tn * 16 + lane % 16) * LF_LDS16 + kb2];
++#pragma unroll
++            for (int tm = 0; tm < TM; ++tm)
++#pragma unroll
++                for (int tn = 0; tn < TN; ++tn)
++                    acc[tm][tn] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(b[tn], a[tm], acc[tm][tn]);
++        }
++        if (s + 1 < nst) lstore(buf ^ 1);
++        __syncthreads();
++    }
++#pragma unroll
++    for (int tm = 0; tm < TM; ++tm) {
++        const int m = m0 + wave_m * TM * 16 + tm * 16 + lane % 16;
++        if (m >= M) continue;
++        const float rs = ldexpf(1.f, (int) emax[m] - LF_SHIFT16);
++#pragma unroll
++        for (int tn = 0; tn < TN; ++tn)
++#pragma unroll
++            for (int v = 0; v < 8; ++v) {
++                const int n = n0 + wave_n * TN * 16 + tn * 16 + v + 8 * (lane / 16);
++                if (n < N) y[(size_t) n * M + m] = acc[tm][tn][v] * xs[n] * rs;
++            }
++    }
++#else
++    GGML_UNUSED_VARS(w, nb01, emax, xh, xs, y, M, N, K);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// fp8: 4x2 waves, 4x4 tiles (256 x 128); f16: 4x2 waves, 2x4 tiles (128 x 128) -- the prototype's best shapes
++constexpr int LF8_WM = 4, LF8_WN = 2, LF8_TM = 4, LF8_TN = 4;
++constexpr int LF16_WM = 4, LF16_WN = 2, LF16_TM = 2, LF16_TN = 4;
++
++// per weight tensor: the largest block exponent of each row (the per-row power-of-two shift), computed on first use
++struct lf_emax_cache {
++    std::mutex mutex;
++    std::map<std::tuple<const void *, int64_t, int64_t, int>, uint8_t *> rows;
++};
++lf_emax_cache & lf_cache() { static lf_emax_cache c; return c; }
++
++const uint8_t * lf_emax_lookup(const ggml_tensor * src0, const int device) {
++    lf_emax_cache & c = lf_cache();
++    std::lock_guard<std::mutex> lock(c.mutex);
++    auto it = c.rows.find({src0->data, src0->ne[0], src0->ne[1], device});
++    return it == c.rows.end() ? nullptr : it->second;
++}
++
++const uint8_t * lf_emax_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
++    if (const uint8_t * p = lf_emax_lookup(src0, ctx.device)) return p;
++    const int64_t M = src0->ne[1];
++    const int nblk = (int) (src0->ne[0] / LF_QK);
++    uint8_t * emax = nullptr;
++    CUDA_CHECK(cudaMalloc(&emax, M));
++    unsigned int * lost = nullptr;
++    if (lf_log()) {
++        CUDA_CHECK(cudaMalloc(&lost, 2 * sizeof(unsigned int)));
++        CUDA_CHECK(cudaMemsetAsync(lost, 0, 2 * sizeof(unsigned int), ctx.stream()));
++    }
++    lf_row_emax<<<(unsigned) M, 256, 0, ctx.stream()>>>((const uint8_t *) src0->data, src0->nb[1], nblk, emax, lost);
++    CUDA_CHECK(cudaGetLastError());
++    if (lost) {
++        unsigned int h[2];
++        CUDA_CHECK(cudaMemcpyAsync(h, lost, sizeof(h), cudaMemcpyDeviceToHost, ctx.stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++        CUDA_CHECK(cudaFree(lost));
++        const double tot = (double) M * nblk;
++        fprintf(stderr, "LF_MXFP4 %-28s M=%6lld K=%6lld  blocks below exact range: fp8 %u (%.4f%%)  f16 %u (%.4f%%)\n",
++            src0->name, (long long) M, (long long) src0->ne[0], h[0], 100.0 * h[0] / tot, h[1], 100.0 * h[1] / tot);
++    }
++    lf_emax_cache & c = lf_cache();
++    std::lock_guard<std::mutex> lock(c.mutex);
++    c.rows[{src0->data, src0->ne[0], src0->ne[1], ctx.device}] = emax;
++    return emax;
++}
++
++#if defined(GGML_LF_HIPBLASLT)
++// ------------------------------------------------------------------------------------------------ hipBLASLt path
++// The weight is copied to fp8 [M][K] with the same per-row power-of-two shift as the fp8 kernel (exact for blocks in
++// range); the shift goes into hipBLASLt's per-row alpha vector.  The activations get ONE scale for the whole batch
++// (hipBLASLt on gfx1201 has no per-column scale mode), passed as the device-side B scale.
++__global__ void lf_mxfp4_to_fp8_rows(const uint8_t * __restrict__ w, const size_t nb01, const int nblk,
++        const uint8_t * __restrict__ emax, uint8_t * __restrict__ w8, const int K) {
++#if defined(RDNA4)
++    const int row = blockIdx.x;
++    const int off = (LF_SHIFT8 - 128) - (int) emax[row];
++    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
++        int e; uint4 qs;
++        lf_load_block(w, (size_t) row * nb01 + (size_t) b * LF_BS, e, qs);
++        int t_lo, t_hi;
++        lf_table_fp8(e + off, t_lo, t_hi);
++        const int q[4] = {(int) qs.x, (int) qs.y, (int) qs.z, (int) qs.w};
++        uint4 lo, hi;
++        lo.x = lf_lookup4(q[0], t_lo, t_hi); hi.x = lf_lookup4(q[0] >> 4, t_lo, t_hi);
++        lo.y = lf_lookup4(q[1], t_lo, t_hi); hi.y = lf_lookup4(q[1] >> 4, t_lo, t_hi);
++        lo.z = lf_lookup4(q[2], t_lo, t_hi); hi.z = lf_lookup4(q[2] >> 4, t_lo, t_hi);
++        lo.w = lf_lookup4(q[3], t_lo, t_hi); hi.w = lf_lookup4(q[3] >> 4, t_lo, t_hi);
++        uint8_t * p = w8 + (size_t) row * K + (size_t) b * LF_QK;
++        *(uint4 *) p        = lo;
++        *(uint4 *) (p + 16) = hi;
++    }
++#else
++    GGML_UNUSED_VARS(w, nb01, nblk, emax, w8, K);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// the same conversion with one thread per 32-value block over the whole matrix (the per-row launch above keeps only
++// 160 of 128 x 2 threads busy at K = 5120 and reaches ~230 GB/s); GGML_LF_MXFP4_CONV=row selects the old kernel
++__global__ void lf_mxfp4_to_fp8_flat(const uint8_t * __restrict__ w, const size_t nb01, const int nblk,
++        const uint8_t * __restrict__ emax, uint8_t * __restrict__ w8, const int K, const int64_t nall) {
++#if defined(RDNA4)
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= nall) return;
++    const int row = (int) (i / nblk), b = (int) (i - (int64_t) row * nblk);
++    const int off = (LF_SHIFT8 - 128) - (int) emax[row];
++    int e; uint4 qs;
++    lf_load_block(w, (size_t) row * nb01 + (size_t) b * LF_BS, e, qs);
++    int t_lo, t_hi;
++    lf_table_fp8(e + off, t_lo, t_hi);
++    const int q[4] = {(int) qs.x, (int) qs.y, (int) qs.z, (int) qs.w};
++    uint4 lo, hi;
++    lo.x = lf_lookup4(q[0], t_lo, t_hi); hi.x = lf_lookup4(q[0] >> 4, t_lo, t_hi);
++    lo.y = lf_lookup4(q[1], t_lo, t_hi); hi.y = lf_lookup4(q[1] >> 4, t_lo, t_hi);
++    lo.z = lf_lookup4(q[2], t_lo, t_hi); hi.z = lf_lookup4(q[2] >> 4, t_lo, t_hi);
++    lo.w = lf_lookup4(q[3], t_lo, t_hi); hi.w = lf_lookup4(q[3] >> 4, t_lo, t_hi);
++    uint8_t * p = w8 + (size_t) row * K + (size_t) b * LF_QK;
++    *(uint4 *) p        = lo;
++    *(uint4 *) (p + 16) = hi;
++#else
++    GGML_UNUSED_VARS(w, nb01, nblk, emax, w8, K, nall);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++__global__ void lf_alpha_vec(const uint8_t * __restrict__ emax, float * __restrict__ av, const int M) {
++    const int m = blockIdx.x * blockDim.x + threadIdx.x;
++    if (m < M) av[m] = ldexpf(1.f, (int) emax[m] - LF_SHIFT8);
++}
++
++// per MXFP4 weight tensor: hipBLASLt's per-row alpha vector (the power-of-two row shift)
++struct lf_m4_state {
++    std::mutex mutex;
++    std::map<std::tuple<const void *, int64_t, int64_t, int>, float *> avec;
++};
++lf_m4_state & lf_m4() { static lf_m4_state s; return s; }
++
++bool lf_blt_ready(const ggml_tensor * src0, const int device, const int M, const int N, const int K) {
++    {
++        lf_m4_state & st = lf_m4();
++        std::lock_guard<std::mutex> lock(st.mutex);
++        if (!st.avec.count({src0->data, src0->ne[0], src0->ne[1], device})) return false;
++    }
++    return ggml_cuda_lf_fp8_gemm_ready(M, N, K);
++}
++
++void lf_blt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const uint8_t * emax,
++        const float * x, float * y, const int M, const int T, const int K) {
++    cudaStream_t stream = ctx.stream();
++    lf_m4_state & st = lf_m4();
++    std::lock_guard<std::mutex> lock(st.mutex);
++
++    const float * av = nullptr;
++    {
++        auto key = std::make_tuple((const void *) src0->data, src0->ne[0], src0->ne[1], ctx.device);
++        auto it = st.avec.find(key);
++        if (it == st.avec.end()) {
++            float * p = nullptr;
++            CUDA_CHECK(cudaMalloc(&p, (size_t) M * sizeof(float)));
++            lf_alpha_vec<<<(M + 255) / 256, 256, 0, stream>>>(emax, p, M);
++            it = st.avec.emplace(key, p).first;
++        }
++        av = it->second;
++    }
++
++    static const bool conv_row = getenv("GGML_LF_MXFP4_CONV") && strcmp(getenv("GGML_LF_MXFP4_CONV"), "row") == 0;
++    ggml_cuda_pool_alloc<uint8_t> w8(ctx.pool(), (size_t) M * K);
++    if (conv_row) {
++        lf_mxfp4_to_fp8_rows<<<M, 128, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], K / LF_QK, emax, w8.get(), K);
++    } else {
++        const int64_t nall = (int64_t) M * (K / LF_QK);
++        lf_mxfp4_to_fp8_flat<<<(unsigned) ((nall + 255) / 256), 256, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], K / LF_QK,
++                                                                                    emax, w8.get(), K, nall);
++    }
++    ggml_cuda_lf_fp8_gemm(ctx, src1, av, w8.get(), y, M, T, K);
++    GGML_UNUSED(x);
++}
++
++#endif // defined(GGML_LF_HIPBLASLT)
++
++} // namespace
++
++bool ggml_cuda_lf_mxfp4_will_take(const ggml_tensor * mm) {
++    if (lf_mode() == 0 || mm == nullptr || mm->op != GGML_OP_MUL_MAT) return false;
++    const ggml_tensor * src0 = mm->src[0], * src1 = mm->src[1];
++    if (src0->type != GGML_TYPE_MXFP4 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) return false;
++    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return false;
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src0->ne[0] % LF_BK8 != 0) return false;
++    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
++    return T >= lf_min_t() && T <= INT32_MAX / 8 && src0->ne[1] <= INT32_MAX / 8;
++}
++
++bool ggml_cuda_lf_mxfp4_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (lf_mode() == 0) return false;
++    if (src0->type != GGML_TYPE_MXFP4 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) return false;
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != LF_BS) return false;
++    if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
++    if (src0->nb[1] % 4 != 0 || (uintptr_t) src0->data % 4 != 0) return false;
++    const int64_t K = src0->ne[0], M = src0->ne[1];
++    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
++    if (K % LF_BK8 != 0 || src1->ne[0] != K || dst->ne[0] != M || ggml_nrows(dst) != T) return false;
++    if (T < lf_min_t() || T > INT32_MAX / 8 || M > INT32_MAX / 8) return false;
++    bool first_use = lf_emax_lookup(src0, ctx.device) == nullptr;
++#if defined(GGML_LF_HIPBLASLT)
++    if (lf_mode() == 3 && !lf_blt_ready(src0, ctx.device, (int) M, (int) T, (int) K)) first_use = true;
++#endif // defined(GGML_LF_HIPBLASLT)
++    if (first_use) { // first use allocates / tunes: not while a CUDA graph is being captured
++#if defined(GGML_USE_HIP)
++        hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
++        if (hipStreamIsCapturing(ctx.stream(), &st) != hipSuccess || st != hipStreamCaptureStatusNone) return false;
++#else
++        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
++        if (cudaStreamIsCapturing(ctx.stream(), &st) != cudaSuccess || st != cudaStreamCaptureStatusNone) return false;
++#endif // defined(GGML_USE_HIP)
++    }
++    return true;
++}
++
++void ggml_cuda_lf_mxfp4_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    cudaStream_t stream = ctx.stream();
++    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
++    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    const uint8_t * emax = lf_emax_get(ctx, src0);
++    const uint8_t * w = (const uint8_t *) src0->data;
++    const float * x = (const float *) src1->data;
++    float * y = (float *) dst->data;
++#if defined(GGML_LF_HIPBLASLT)
++    if (lf_mode() == 3) {
++        lf_blt_mul_mat(ctx, src0, src1, emax, x, y, M, T, K);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++#endif // defined(GGML_LF_HIPBLASLT)
++    ggml_cuda_pool_alloc<float> xs(ctx.pool(), T);
++    if (lf_mode() == 1) {
++        ggml_cuda_pool_alloc<uint8_t> xq(ctx.pool(), (size_t) T * K);
++        lf_quant_act_fp8<<<T, 256, 0, stream>>>(x, xq.get(), xs.get(), K);
++        constexpr int BMt = LF8_WM * LF8_TM * 16, BNt = LF8_WN * LF8_TN * 16;
++        static const int cfg = getenv("GGML_LF_MXFP4_CFG") ? atoi(getenv("GGML_LF_MXFP4_CFG")) : 0; // experiment
++        if (cfg != 0) {
++            auto run = [&](auto kern, const int bm, const int bn, const int bk, const int nthr) {
++                if (K % bk != 0) return false;
++                const dim3 g((T + bn - 1) / bn, (M + bm - 1) / bm, 1);
++                kern<<<g, nthr, 0, stream>>>(w, src0->nb[1], emax, xq.get(), xs.get(), y, M, T, K, K / bk);
++                return true;
++            };
++            bool done = false;
++            switch (cfg) {
++                case 1: done = run(lf_gemm_fp8<2, 2, 2, 2, 128>,  64,  64, 128, 128); break;
++                case 2: done = run(lf_gemm_fp8<2, 2, 4, 4,  64>, 128, 128,  64, 128); break;
++                case 3: done = run(lf_gemm_fp8<4, 2, 2, 2, 128>, 128,  64, 128, 256); break;
++                case 4: done = run(lf_gemm_fp8<2, 2, 2, 4, 128>,  64, 128, 128, 128); break;
++                case 5: done = run(lf_gemm_fp8<2, 4, 2, 2, 128>,  64, 128, 128, 256); break;
++                case 6: done = run(lf_gemm_fp8<4, 2, 2, 2,  64>, 128,  64,  64, 256); break;
++                case 7: done = run(lf_gemm_fp8<2, 2, 4, 2,  64>, 128,  64,  64, 128); break;
++            }
++            if (done) { CUDA_CHECK(cudaGetLastError()); return; }
++        }
++        // split-K against the tail of the last round of blocks: pick ks (1..4) minimizing the modelled time
++        // rounds(ks) * t_block / ks + partial-sum traffic (write + read of ks slices, deterministic reduce)
++        const int gm = (M + BMt - 1) / BMt, gn = (T + BNt - 1) / BNt, nb = gm * gn, nst_all = K / LF_BK8;
++        const int conc = 2 * ggml_cuda_info().devices[ctx.device].nsm;   // 2 blocks per WGP (LDS)
++        const double t_block = 2.0 * BMt * BNt * K / (150e12 / conc);   // s, at ~150 TFLOPS for the whole GPU
++        int ks = 1; double best = 1e30;
++        for (int c = 1; c <= 4; ++c) {
++            if (nst_all / c < 8) break;
++            const double t = (double) ((nb * c + conc - 1) / conc) * t_block / c + (c > 1 ? (c + 1) * 4.0 * M * T / 500e9 : 0.0);
++            if (t < best * 0.97) { best = t; ks = c; }
++        }
++        { static const int ov = getenv("GGML_LF_MXFP4_SPLITK") ? atoi(getenv("GGML_LF_MXFP4_SPLITK")) : 0; if (ov > 0) ks = std::min(ov, nst_all); } // experiment
++        const int nst_per = (nst_all + ks - 1) / ks;
++        ks = (nst_all + nst_per - 1) / nst_per;
++        const bool split = ks > 1 && (size_t) M * T % 4 == 0;
++        if (!split) ks = 1;
++        ggml_cuda_pool_alloc<float> part(ctx.pool(), split ? (size_t) ks * M * T : 1);
++        const dim3 grid(gn, gm, ks);
++        lf_gemm_fp8<LF8_WM, LF8_WN, LF8_TM, LF8_TN><<<grid, LF8_WM * LF8_WN * 32, 0, stream>>>(
++            w, src0->nb[1], emax, xq.get(), xs.get(), split ? part.get() : y, M, T, K, split ? nst_per : nst_all);
++        if (split) {
++            const size_t n4 = (size_t) M * T / 4;
++            lf_splitk_reduce<<<(unsigned) ((n4 + 255) / 256), 256, 0, stream>>>(part.get(), y, n4, ks);
++        }
++    } else {
++        ggml_cuda_pool_alloc<_Float16> xh(ctx.pool(), (size_t) T * K);
++        lf_quant_act_f16<<<T, 256, 0, stream>>>(x, xh.get(), xs.get(), K);
++        constexpr int BMt = LF16_WM * LF16_TM * 16, BNt = LF16_WN * LF16_TN * 16;
++        const dim3 grid((M + BMt - 1) / BMt, (T + BNt - 1) / BNt);
++        lf_gemm_f16<LF16_WM, LF16_WN, LF16_TM, LF16_TN><<<grid, LF16_WM * LF16_WN * 32, 0, stream>>>(
++            w, src0->nb[1], emax, xh.get(), xs.get(), y, M, T, K);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_lf_mxfp4_graph_begin() {
++    // the shared fp8 activations live in K1 (lf-kq-blas.cu); ggml_cuda_lf_kq_blas_graph_begin() expires them
++}
+diff --git a/ggml/src/ggml-cuda/lf-mxfp4.cuh b/ggml/src/ggml-cuda/lf-mxfp4.cuh
+new file mode 100644
+index 000000000..4f8d04945
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lf-mxfp4.cuh
+@@ -0,0 +1,21 @@
++#pragma once
++#include "common.cuh"
++// Llama-Frankenstein: MXFP4 "direct path" GEMM for RDNA4 prefill (written by Claude).
++// GGML_LF_MXFP4_DIRECT=blaslt | fp8 | f16 turns it on (unset: off, nothing changes):
++//   blaslt  each weight is copied to fp8 e4m3 (exact per block, per-row power-of-two shift) and multiplied by hipBLASLt's fp8
++//           GEMM; activations fp8 with one scale per batch, converted once per input and graph (the fastest mode)
++//   fp8/f16 the same conversion inside this file's own WMMA GEMM kernels (activation scale per token)
++// GGML_LF_MXFP4_MIN_T (default 64) is the smallest token count it takes (decode / verify never reach it);
++// GGML_LF_MXFP4_ALGOS (blaslt): unset = the built-in gfx1201 fp8 priority list (no timing, the same choice every run),
++// heur = hipBLASLt's first heuristic candidate, timed = time the candidates on the first whole batch (old; can differ
++// from run to run); GGML_LF_MXFP4_LOG=1 prints one line per weight tensor / algorithm choice.
++// The MXFP4 block scale is a power of two, so each block converts exactly into fp8 e4m3 / f16 and the scale folds
++// into the weights: one WMMA accumulation over the whole K and one epilogue per output (no per-32 float epilogue).
++// Activations are fp8 e4m3 (one scale per token) or f16 (one power-of-two scale per token), so results differ from
++// mmq (int8 per-32 activations).
++bool ggml_cuda_lf_mxfp4_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++void ggml_cuda_lf_mxfp4_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++// start of a graph: the fp8 activations shared by the MUL_MATs of one graph are invalid from here on
++void ggml_cuda_lf_mxfp4_graph_begin();
++// the fusions that would take an MXFP4 prefill matmul (dense gate+up pair, swiglu -> mmq down) stand down for this path
++bool ggml_cuda_lf_mxfp4_will_take(const ggml_tensor * mm);

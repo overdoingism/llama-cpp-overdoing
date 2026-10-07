@@ -1,0 +1,611 @@
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 4d2e71803..27f1bd969 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -4,6 +4,7 @@
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
++#include "lf-fa-fp8.cuh"
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ // one list per group of ncols1 queries: a column is selected if any query of the group can see it
+@@ -888,6 +889,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    // Llama-Frankenstein: FP8 prefill attention (GGML_LF_FA_FP8=1, off by default; see lf-fa-fp8.cuh)
++    if (ggml_cuda_lf_fa_fp8_supported(ctx, dst)) {
++        ggml_cuda_lf_fa_fp8(ctx, dst);
++        return;
++    }
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cu b/ggml/src/ggml-cuda/lf-fa-fp8.cu
+new file mode 100644
+index 000000000..39b27d348
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lf-fa-fp8.cu
+@@ -0,0 +1,563 @@
++#include "lf-fa-fp8.cuh"
++
++#include <algorithm>
++#include <cstring>
++#include <map>
++#include <mutex>
++
++// Layout notes (gfx12 WMMA 16x16x16 fp8, wave32): operand lane l holds row l%16, k = (l/16)*8 .. +7; result element
++// (v, lane) is row v + 8*(lane/16) of the first operand, column lane%16 of the second.  With S^T = K Q^T each lane
++// holds, for its query (lane%16), 8 consecutive keys -- exactly the B-operand layout of P^T in O^T += V^T P^T.
++
++namespace {
++
++// head size D (K and V, 64 / 128 / 256) is a template parameter of every kernel
++constexpr int LF_QB  = 16;            // query tokens per block
++constexpr int LF_KT  = 64;            // keys per tile
++constexpr int LF_VS  = LF_KT + 16;    // LDS bytes per dim row of V^T (16-byte aligned rows: operand pairs load as b128)
++constexpr int LF_MAXSPLIT = 8;
++
++int lf_on()    { static const int v = getenv("GGML_LF_FA_FP8") ? atoi(getenv("GGML_LF_FA_FP8")) : 0; return v; }
++int lf_min_kv() { static const int v = getenv("GGML_LF_FA_FP8_MIN_KV") ? atoi(getenv("GGML_LF_FA_FP8_MIN_KV")) : 512; return v; }
++int lf_min_t() { static const int v = getenv("GGML_LF_FA_FP8_MIN_T") ? atoi(getenv("GGML_LF_FA_FP8_MIN_T")) : 32; return v; }
++
++typedef int   lf_v2i __attribute__((ext_vector_type(2)));
++typedef int   lf_v4i __attribute__((ext_vector_type(4)));
++
++// software pipeline for a run of NLOAD LDS operand loads each feeding 2 WMMAs: keep one load ahead
++// (sched_group_barrier masks: 0x100 = DS read, 0x008 = MFMA/WMMA)
++template <int NLOAD>
++static __device__ __forceinline__ void lf_pipe_ds_wmma() {
++    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0);
++#pragma unroll
++    for (int i = 0; i < NLOAD - 2; ++i) {
++        __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
++        __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
++    }
++    __builtin_amdgcn_sched_group_barrier(0x008, 4, 0);
++}
++
++// Operand-pair layout: along the reduction axis (K and Q: dims, V^T: keys) the 8-byte units of each 32-element group
++// are stored as (step 0, half 0), (step 1, half 0), (step 0, half 1), (step 1, half 1), so the lane that reads half h
++// finds the operands of two consecutive 16-wide WMMA steps in one 16-byte load.  K and Q use the same order, so the
++// dot products are unchanged.  lf_pair_unit maps a natural 8-byte unit index (0..3 in the group) to its slot.
++static __device__ __forceinline__ int lf_pair_unit(const int u) { return u == 1 ? 2 : (u == 2 ? 1 : u); }
++typedef float lf_v8f __attribute__((ext_vector_type(8)));
++
++// 8 q8_0 values (one lane's share of a 256-vector: block l/4, bytes (l%4)*8 .. +7) as floats; 2-byte aligned reads
++static __device__ __forceinline__ void lf_q8_0_load8(const char * __restrict__ row, const int lane, float * v) {
++    const char * blk = row + (lane / 4) * 34;
++    const float d = __half2float(*(const half *) blk);
++    const uint16_t * q = (const uint16_t *) (blk + 2 + (lane % 4) * 8);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const uint16_t w = q[j];
++        v[2 * j + 0] = d * (float) (int8_t) (w & 0xFF);
++        v[2 * j + 1] = d * (float) (int8_t) (w >> 8);
++    }
++}
++
++static __device__ __forceinline__ uint2 lf_pack_fp8(const float * v, const float inv) {
++#if defined(RDNA4)
++    int w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[0] * inv, v[1] * inv, 0, false);
++    w0     = __builtin_amdgcn_cvt_pk_fp8_f32(v[2] * inv, v[3] * inv, w0, true);
++    int w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[4] * inv, v[5] * inv, 0, false);
++    w1     = __builtin_amdgcn_cvt_pk_fp8_f32(v[6] * inv, v[7] * inv, w1, true);
++    return make_uint2((uint32_t) w0, (uint32_t) w1);
++#else
++    GGML_UNUSED_VARS(v, inv);
++    return make_uint2(0, 0);
++#endif // defined(RDNA4)
++}
++
++static __device__ __forceinline__ float lf_wave_max(float a) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o, 32));
++    return a;
++}
++
++// K: one wave per (cell, kv head) vector (lanes < D/8, 8 values each) -> k8[hk][j][D] fp8 with ONE scale per kv head
++// (amax from the q8_0 scales, see lf_fa_conv_v_amax), so the score scale is a single constant per (query, head);
++// ks[hk] (cells >= n_kv are zero)
++template <int D>
++__global__ void lf_fa_conv_k(const char * __restrict__ K, const int64_t nb11, const int64_t nb12, const int n_kv, const int n_kv_pad,
++        const unsigned int * __restrict__ kbits, uint8_t * __restrict__ k8, float * __restrict__ ks) {
++    const int lane = threadIdx.x % 32, j = blockIdx.x * 8 + threadIdx.x / 32, hk = blockIdx.y;
++    if (j >= n_kv_pad) return;
++    float a = 0.f;
++#pragma unroll
++    for (int b = 0; b < D / 32; ++b) a = fmaxf(a, __uint_as_float(kbits[hk * (D / 32) + b]));
++    if (lane >= D / 8) return;
++    float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    if (j < n_kv) lf_q8_0_load8(K + j * nb11 + hk * nb12, lane, v);
++    const float inv = a > 0.f ? 448.f / a : 0.f;
++    *(uint2 *) (k8 + ((size_t) hk * n_kv_pad + j) * D + (lane / 4) * 32 + lf_pair_unit(lane % 4) * 8) = lf_pack_fp8(v, inv);
++    if (j == 0 && lane == 0) ks[hk] = a > 0.f ? a / 448.f : 0.f;
++}
++
++// V pass 1: per (kv head, group of 32 channels) amax over the cells.  A q8_0 block's largest |value| is exactly
++// |d| * 127 (quantization maps the block's amax to +-127), so only the scales are read (1/17 of the cache).
++// Threads: (256 / NG) cells x NG = D/32 groups; chunks of 256 cells per block; atomicMax on the float bits.
++template <int D>
++__global__ void lf_fa_conv_v_amax(const char * __restrict__ V, const int64_t nb21, const int64_t nb22, const int n_kv,
++        unsigned int * __restrict__ vbits) {
++    constexpr int NG = D / 32;
++    const int hk = blockIdx.x, b = threadIdx.x % NG, jj = threadIdx.x / NG, j0 = blockIdx.y * 256;
++    float a = 0.f;
++    for (int j = j0 + jj; j < min(n_kv, j0 + 256); j += 256 / NG) {
++        a = fmaxf(a, fabsf(__half2float(*(const half *) (V + j * nb21 + hk * nb22 + b * 34))));
++    }
++#pragma unroll
++    for (int o = NG; o < 32; o <<= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o, 32));
++    if (threadIdx.x % 32 < NG) atomicMax(&vbits[hk * NG + b], __float_as_uint(a * 127.f));
++}
++template <int D>
++__global__ void lf_fa_conv_v_scale(const unsigned int * __restrict__ vbits, float * __restrict__ vs) {
++    const float a = __uint_as_float(vbits[blockIdx.x * (D / 32) + threadIdx.x / 32]);
++    vs[blockIdx.x * D + threadIdx.x] = a > 0.f ? a / 448.f : 1.f;
++}
++// V pass 2: 64 cells x D channels of one kv head (D threads), transposed through LDS -> v8t[hk][d][j]
++template <int D>
++__global__ void lf_fa_conv_v(const char * __restrict__ V, const int64_t nb21, const int64_t nb22, const int n_kv, const int n_kv_pad,
++        const float * __restrict__ vs, uint8_t * __restrict__ v8t) {
++#if defined(RDNA4)
++    const int j0 = blockIdx.x * 64, hk = blockIdx.y, i = threadIdx.x;
++    __shared__ uint8_t tile[D][64 + 4];
++    const float inv = 1.f / vs[hk * D + i];
++    for (int jj = 0; jj < 64; ++jj) {
++        const int j = j0 + jj;
++        uint8_t q = 0;
++        if (j < n_kv) {
++            const char * blk = V + j * nb21 + hk * nb22 + (i / 32) * 34;
++            q = (uint8_t) __builtin_amdgcn_cvt_pk_fp8_f32(__half2float(*(const half *) blk) * (float) (int8_t) blk[2 + i % 32] * inv, 0.f, 0, false);
++        }
++        tile[i][(jj / 32) * 32 + lf_pair_unit((jj % 32) / 8) * 8 + jj % 8] = q;
++    }
++    __syncthreads();
++    for (int c = i; c < D * 4; c += D) {
++        const int r = c / 4, o = c % 4;
++        uint32_t w[4];
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const uint8_t * t = &tile[r][o * 16 + 4 * k];
++            w[k] = t[0] | (t[1] << 8) | (t[2] << 16) | ((uint32_t) t[3] << 24);
++        }
++        *(uint4 *) (v8t + ((size_t) hk * D + r) * n_kv_pad + j0 + o * 16) = make_uint4(w[0], w[1], w[2], w[3]);
++    }
++#else
++    GGML_UNUSED_VARS(V, nb21, nb22, n_kv, n_kv_pad, vs, v8t);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++// Q: one wave per (token, head) vector (lanes < D/8) -> q8[t][h][D], qs[t][h] (tokens >= n_q are zero)
++template <int D>
++__global__ void lf_fa_conv_q(const char * __restrict__ Q, const int64_t nb01, const int64_t nb02, const int n_q, const int n_q_pad, const int HQ,
++        uint8_t * __restrict__ q8, float * __restrict__ qs) {
++    const int lane = threadIdx.x % 32, t = blockIdx.x * 8 + threadIdx.x / 32, h = blockIdx.y;
++    if (t >= n_q_pad) return;
++    float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    if (t < n_q && lane < D / 8) {
++        const float4 * p = (const float4 *) (Q + t * nb01 + h * nb02 + lane * 32);
++        const float4 a = p[0], b = p[1];
++        v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
++    }
++    float a = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) a = fmaxf(a, fabsf(v[i]));
++    a = lf_wave_max(a);
++    const float inv = a > 0.f ? 448.f / a : 0.f;
++    if (lane < D / 8) *(uint2 *) (q8 + ((size_t) t * HQ + h) * D + (lane / 4) * 32 + lf_pair_unit(lane % 4) * 8) = lf_pack_fp8(v, inv);
++    if (lane == 0) qs[(size_t) t * HQ + h] = a > 0.f ? a / 448.f : 0.f;
++}
++
++// derived mask: per 64-key tile, the (min, max) cell position (INT32_MIN in .x when a cell of the tile is never visible)
++__global__ void lf_fa_tile_range(const int * __restrict__ cell_pos, const int n_kv, int2 * __restrict__ trange) {
++    const int j = blockIdx.x * LF_KT + threadIdx.x;   // 64 threads
++    const int p = j < n_kv ? cell_pos[j] : INT32_MIN;
++    int mn = p, mx = p;
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        mn = min(mn, __shfl_xor_sync(0xFFFFFFFF, mn, o, 32));
++        mx = max(mx, __shfl_xor_sync(0xFFFFFFFF, mx, o, 32));
++    }
++    __shared__ int2 w[2];
++    if (threadIdx.x % 32 == 0) w[threadIdx.x / 32] = make_int2(mn, mx);
++    __syncthreads();
++    if (threadIdx.x == 0) trange[blockIdx.x] = make_int2(min(w[0].x, w[1].x), max(w[0].y, w[1].y));
++}
++
++// Block = one kv head x LF_QB tokens; wave g = Q head hk*G + g for those tokens.  Visibility: derived (cell_pos,
++// tok_lo, tok_hi) or an f16 mask tensor (added), or none.  Writes a split's unnormalized O (x vs) and (max, sum).
++template <int G, int D>
++__global__ void __launch_bounds__(G * 32, 1) lf_fa_attn(
++        const uint8_t * __restrict__ q8, const float * __restrict__ qs,
++        const uint8_t * __restrict__ k8, const float * __restrict__ ks,
++        const uint8_t * __restrict__ v8t, const float * __restrict__ vs,
++        const int * __restrict__ cell_pos, const int * __restrict__ tok_lo, const int * __restrict__ tok_hi, const int2 * __restrict__ trange,
++        const char * __restrict__ mask, const int64_t nb31,
++        half * __restrict__ part, float2 * __restrict__ ml,
++        const int n_q, const int n_q_pad, const int n_kv, const int n_kv_pad, const float scale_log2) {
++#if defined(RDNA4)
++    constexpr int LF_KS = D + 16;      // LDS bytes per key row of K
++    __shared__ __attribute__((aligned(16))) uint8_t Ks[LF_KT * LF_KS];
++    __shared__ __attribute__((aligned(16))) uint8_t Vs[D * LF_VS];
++    const int tid = threadIdx.x, lane = tid % 32, g = tid / 32;
++    const int HQ = gridDim.y * G;
++    const int t0 = blockIdx.x * LF_QB, hk = blockIdx.y, h = hk * G + g;
++    const int tq = t0 + lane % 16;
++    const int tqc = min(tq, n_q - 1);
++    const int lo = cell_pos ? tok_lo[tqc] : 0, hi = cell_pos ? tok_hi[tqc] : 0;
++    const half * mrow = mask ? (const half *) (mask + (int64_t) tqc * nb31) : nullptr;
++    // the block's query window (derived mask): a tile whose cells all lie in [lo_max, hi_min] is visible to every query
++    int lo_max = lo, lo_min = lo, hi_min = hi, hi_max = hi;
++#pragma unroll
++    for (int o = 1; o < 16; o <<= 1) {
++        lo_max = max(lo_max, __shfl_xor_sync(0xFFFFFFFF, lo_max, o, 32)); lo_min = min(lo_min, __shfl_xor_sync(0xFFFFFFFF, lo_min, o, 32));
++        hi_min = min(hi_min, __shfl_xor_sync(0xFFFFFFFF, hi_min, o, 32)); hi_max = max(hi_max, __shfl_xor_sync(0xFFFFFFFF, hi_max, o, 32));
++    }
++
++    lf_v2i qa[D / 16];
++#pragma unroll
++    for (int g2 = 0; g2 < D / 32; ++g2) {
++        const lf_v4i q4 = *(const lf_v4i *) (q8 + ((size_t) tq * HQ + h) * D + g2 * 32 + (lane / 16) * 16);
++        qa[2 * g2] = lf_v2i{q4.x, q4.y}; qa[2 * g2 + 1] = lf_v2i{q4.z, q4.w};
++    }
++    const float kqc = qs[(size_t) tq * HQ + h] * ks[hk] * scale_log2;  // score = kqc * (K8 . Q8), log2 domain
++
++    lf_v8f o[D / 16];
++#pragma unroll
++    for (int i = 0; i < D / 16; ++i) o[i] = lf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
++    float m = -INFINITY, l = 0.f;
++
++    const int ntile = n_kv_pad / LF_KT;
++    const int nsplit = gridDim.z, per = (ntile + nsplit - 1) / nsplit;
++    const int kt_begin = blockIdx.z * per, kt_end = min(ntile, kt_begin + per);
++    for (int kt = kt_begin; kt < kt_end; ++kt) {
++        const int k0 = kt * LF_KT;
++        // tile visibility (derived mask): skip tiles no query of the block sees; "full" tiles need no per-element test.
++        // Everything here is uniform over the block (all waves share the tokens).
++        bool full = cell_pos == nullptr && mrow == nullptr && k0 + LF_KT <= n_kv;
++        if (cell_pos) {
++            const int2 r = trange[kt];
++            if (r.y < lo_min || (r.x != INT32_MIN && r.x > hi_max)) continue;               // no query sees any cell
++            full = r.x != INT32_MIN && r.x >= lo_max && r.y <= hi_min && k0 + LF_KT <= n_kv;
++        }
++
++        // tile loads without conditions or clamped indices: chunk c = tid + i*NT for the full rounds, then the remainder
++        // chunks loaded by every thread (duplicates rewrite the same bytes).  Walking pointers (base + i * step) keep the
++        // register cost independent of the number of rounds (small G has many).  K's tile is contiguous in k8; V^T's
++        // rows are n_kv_pad apart.  NT is a multiple of 32, so (c / 4, c % 4) and (c / (D/16), c % (D/16)) advance by
++        // fixed amounts per round.
++        {
++            constexpr int NT = G * 32, NC = LF_KT * (D / 16), NFULL = NC / NT, NREM = NC - NFULL * NT, NB = 3;
++            static_assert(NT % (D / 16) == 0 || (D / 16) % NT == 0, "K chunk walk");
++            const uint8_t * kb = k8 + ((size_t) hk * n_kv_pad + k0) * D;
++            const uint8_t * vb = v8t + (size_t) hk * D * n_kv_pad + k0;
++            auto kst_off = [&](const int c) { return (c / (D / 16)) * LF_KS + (c % (D / 16)) * 16; };
++            auto vst_off = [&](const int c) { return (c / (LF_KT / 16)) * LF_VS + (c % (LF_KT / 16)) * 16; };
++            {
++                const uint8_t * kp = kb + (size_t) tid * 16;
++#pragma unroll
++                for (int i0 = 0; i0 < NFULL; i0 += NB) {
++                    uint4 w[NB];
++#pragma unroll
++                    for (int i = 0; i < NB; ++i) if (i0 + i < NFULL) w[i] = *(const uint4 *) (kp + (size_t) (i0 + i) * NT * 16);
++#pragma unroll
++                    for (int i = 0; i < NB; ++i) if (i0 + i < NFULL) *(uint4 *) &Ks[kst_off(tid + (i0 + i) * NT)] = w[i];
++                    __builtin_amdgcn_sched_barrier(0);
++                }
++                if constexpr (NREM > 0) { const int c = NFULL * NT + tid % NREM; *(uint4 *) &Ks[kst_off(c)] = *(const uint4 *) (kb + (size_t) c * 16); }
++            }
++            {
++                const uint8_t * vp = vb + (size_t) (tid / (LF_KT / 16)) * n_kv_pad + (tid % (LF_KT / 16)) * 16;
++                const size_t vstep = (size_t) (NT / (LF_KT / 16)) * n_kv_pad;
++#pragma unroll
++                for (int i0 = 0; i0 < NFULL; i0 += NB) {
++                    uint4 w[NB];
++#pragma unroll
++                    for (int i = 0; i < NB; ++i) if (i0 + i < NFULL) w[i] = *(const uint4 *) (vp + (i0 + i) * vstep);
++#pragma unroll
++                    for (int i = 0; i < NB; ++i) if (i0 + i < NFULL) *(uint4 *) &Vs[vst_off(tid + (i0 + i) * NT)] = w[i];
++                    __builtin_amdgcn_sched_barrier(0);
++                }
++                if constexpr (NREM > 0) {
++                    const int c = NFULL * NT + tid % NREM;
++                    *(uint4 *) &Vs[vst_off(c)] = *(const uint4 *) (vb + (size_t) (c / (LF_KT / 16)) * n_kv_pad + (c % (LF_KT / 16)) * 16);
++                }
++            }
++        }
++        __syncthreads();
++
++        lf_v8f s[LF_KT / 16];
++#pragma unroll
++        for (int ks_ = 0; ks_ < LF_KT / 16; ++ks_) {
++            s[ks_] = lf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
++#pragma unroll
++            for (int g2 = 0; g2 < D / 32; ++g2) {
++                const lf_v4i k4 = *(const lf_v4i *) &Ks[(ks_ * 16 + lane % 16) * LF_KS + g2 * 32 + (lane / 16) * 16];
++                s[ks_] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{k4.x, k4.y}, qa[2 * g2],     s[ks_]);
++                s[ks_] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{k4.z, k4.w}, qa[2 * g2 + 1], s[ks_]);
++            }
++        }
++        lf_pipe_ds_wmma<(LF_KT / 16) * (D / 32)>();
++        float mt = -INFINITY;
++        float cc = kqc;   // full tiles keep the raw dot products (scaled inside the exp2's fma); others are pre-scaled
++        if (full) {
++#pragma unroll
++            for (int ks_ = 0; ks_ < LF_KT / 16; ++ks_)
++#pragma unroll
++                for (int v = 0; v < 8; ++v) mt = fmaxf(mt, s[ks_][v]);
++            mt *= kqc;    // kqc >= 0
++        } else {
++            cc = 1.f;
++#pragma unroll
++            for (int ks_ = 0; ks_ < LF_KT / 16; ++ks_)
++#pragma unroll
++                for (int v = 0; v < 8; ++v) {
++                    const int kk = ks_ * 16 + v + 8 * (lane / 16), j = k0 + kk;
++                    float x = s[ks_][v] * kqc;
++                    bool vis = j < n_kv;
++                    if (vis && cell_pos) {
++                        const int p = cell_pos[j];
++                        vis = p >= lo && p <= hi;
++                    }
++                    if (vis && mrow) x += __half2float(mrow[j]) * 1.4426950408889634f; // scores are in the log2 domain
++                    x = vis ? x : -INFINITY;
++                    s[ks_][v] = x;
++                    mt = fmaxf(mt, x);
++                }
++        }
++        mt = fmaxf(mt, __shfl_xor_sync(0xFFFFFFFF, mt, 16, 32));
++        const float mn    = fmaxf(m, mt);
++        const float alpha = mn == -INFINITY ? 1.f : __builtin_amdgcn_exp2f(m - mn);
++        const float msub  = (mn == -INFINITY ? 0.f : mn) - 8.f;   // P is produced x 2^8 (fp8 range), l likewise
++        m = mn;
++        float ls = 0.f;
++        lf_v2i p8[LF_KT / 16];
++#pragma unroll
++        for (int ks_ = 0; ks_ < LF_KT / 16; ++ks_) {
++            float p[8];
++#pragma unroll
++            for (int v = 0; v < 8; ++v) { p[v] = __builtin_amdgcn_exp2f(fmaf(s[ks_][v], cc, -msub)); ls += p[v]; }
++            const uint2 w = lf_pack_fp8(p, 1.f);
++            p8[ks_] = lf_v2i{(int) w.x, (int) w.y};
++        }
++        l = l * alpha + ls;
++        if (__ballot(alpha != 1.f)) { // the running max moved for some query of this wave (exact: x * 1 == x)
++#pragma unroll
++            for (int i = 0; i < D / 16; ++i) o[i] *= alpha;
++        }
++#pragma unroll
++        for (int i = 0; i < D / 16; ++i)
++#pragma unroll
++            for (int g2 = 0; g2 < LF_KT / 32; ++g2) {
++                const lf_v4i v4 = *(const lf_v4i *) &Vs[(i * 16 + lane % 16) * LF_VS + g2 * 32 + (lane / 16) * 16];
++                o[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{v4.x, v4.y}, p8[2 * g2],     o[i]);
++                o[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{v4.z, v4.w}, p8[2 * g2 + 1], o[i]);
++            }
++        lf_pipe_ds_wmma<(D / 16) * (LF_KT / 32)>();
++        __syncthreads();
++    }
++    l += __shfl_xor_sync(0xFFFFFFFF, l, 16, 32);
++    if (tq >= n_q) return;
++    // partial result normalized by its own sum (a weighted mean of V, so f16 holds it); the combine re-weights by l
++    half * po = part + (size_t) blockIdx.z * n_q_pad * HQ * D;
++    const float linv = l > 0.f ? 1.f / l : 0.f;
++#pragma unroll
++    for (int i = 0; i < D / 16; ++i)
++#pragma unroll
++        for (int v = 0; v < 8; ++v) {
++            const int d = i * 16 + v + 8 * (lane / 16);
++            po[((size_t) tq * HQ + h) * D + d] = __float2half(o[i][v] * vs[hk * D + d] * linv);
++        }
++    if (lane < 16) ml[(size_t) blockIdx.z * n_q_pad * HQ + (size_t) tq * HQ + h] = make_float2(m, l);
++#else
++    GGML_UNUSED_VARS(q8, qs, k8, ks, v8t, vs, cell_pos, tok_lo, tok_hi, trange, mask, nb31, part, ml, n_q, n_q_pad, n_kv, n_kv_pad, scale_log2);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// merge the splits: out[t][h][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = 2^(m_s - M); (fully masked rows: 0)
++template <int D>
++__global__ void lf_fa_combine(const half * __restrict__ part, const float2 * __restrict__ ml, float * __restrict__ dst,
++        const int n_q_pad, const int HQ, const int nsplit) {
++    const int row = blockIdx.x, d = threadIdx.x; // row = t*HQ + h
++    float M = -INFINITY;
++    for (int s = 0; s < nsplit; ++s) M = fmaxf(M, ml[(size_t) s * n_q_pad * HQ + row].x);
++    float num = 0.f, den = 0.f;
++    if (M != -INFINITY) {
++        for (int s = 0; s < nsplit; ++s) {
++            const float2 v = ml[(size_t) s * n_q_pad * HQ + row];
++            if (v.x == -INFINITY) continue;
++            const float w = exp2f(v.x - M);
++            num += w * v.y * __half2float(part[(size_t) s * n_q_pad * HQ * D + (size_t) row * D + d]);
++            den += w * v.y;
++        }
++    }
++    dst[(size_t) row * D + d] = den > 0.f ? num / den : 0.f;
++}
++
++// One persistent scratch per stream for a call's operands (fp8 K, fp8 V^T, fp8 Q, their scales, the split partials),
++// sized on first use for the whole KV cache (the K view's source tensor) and never shrunk, so a growing prefix does
++// not reallocate (each reallocation waits for the stream: growing by 25% cost 1.5% of a 30K prefill).  The ggml pool keeps every size it has handed out, and these requests grow
++// with the prefix, so a long prefill left one buffer per size behind (Q5_K_M 100K: +2.2 GiB, and on Windows that spills
++// into shared memory instead of failing).  Per stream: the main and the draft model may run on different streams.
++struct lf_fa_arena {
++    char * ptr  = nullptr;
++    size_t size = 0;
++};
++std::mutex g_lf_fa_arena_mutex;
++std::map<cudaStream_t, lf_fa_arena> g_lf_fa_arena;
++
++// nullptr when the device has no room (the caller then takes one pool buffer for this call).  need: this call;
++// want: the size for the whole cache, allocated when the scratch has to grow
++char * lf_fa_arena_get(cudaStream_t stream, const size_t need, const size_t want) {
++    std::lock_guard<std::mutex> lock(g_lf_fa_arena_mutex);
++    lf_fa_arena & a = g_lf_fa_arena[stream];
++    if (a.size < need) {
++        if (a.ptr) {
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            CUDA_CHECK(cudaFree(a.ptr));
++            a.ptr = nullptr; a.size = 0;
++        }
++        size_t sz = std::max(need, want);
++        if (cudaMalloc((void **) &a.ptr, sz) != cudaSuccess) {
++            (void) cudaGetLastError();
++            sz = need + need / 4; // the whole cache does not fit: this call with 25% headroom
++            if (cudaMalloc((void **) &a.ptr, sz) != cudaSuccess) {
++                (void) cudaGetLastError();
++                a.ptr = nullptr;
++                return nullptr;
++            }
++        }
++        a.size = sz;
++    }
++    return a.ptr;
++}
++
++size_t lf_fa_align(const size_t n) { return (n + 255) / 256 * 256; }
++
++template <int D>
++void lf_fa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
++    const bool derived = dst->src[5] != nullptr;
++    cudaStream_t stream = ctx.stream();
++    ggml_cuda_pool & pool = ctx.pool();
++    const int n_q = (int) Q->ne[1], HQ = (int) Q->ne[2], n_kv = (int) K->ne[1], HKV = (int) K->ne[2], G = HQ / HKV;
++    const int n_q_pad  = (n_q + LF_QB - 1) / LF_QB * LF_QB;
++    const int n_kv_pad = (n_kv + LF_KT - 1) / LF_KT * LF_KT;
++    float scale;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++
++    // split the keys: about one split per 80 tiles at 128 query blocks (measured on gfx1201, head 256: 8K -> 2,
++    // 32K -> 6, 90K -> 8 at ubatch 512), fewer when the query grid alone is larger; at least 2 tiles per split
++    const int base = (n_q_pad / LF_QB) * HKV, ntile = n_kv_pad / LF_KT;
++    int nsplit = std::max(1, std::min({LF_MAXSPLIT, (int) (((int64_t) ntile * 128 + (int64_t) 40 * base) / ((int64_t) 80 * base)), ntile / 2}));
++
++    // operands of this call, carved from the per-stream scratch (sizes in elements); the same layout for the whole KV
++    // cache (n_kv_cap keys, the most splits) gives the size reserved on first use
++    const int64_t n_kv_cap = std::max<int64_t>(n_kv_pad, K->view_src ? (K->view_src->ne[1] + LF_KT - 1) / LF_KT * LF_KT : 0);
++    auto layout_bytes = [&](const int64_t nkv, const int ns, size_t * out) {
++        const size_t sz[] = { (size_t) HKV * nkv * D, (size_t) HKV * nkv * D, (size_t) n_q_pad * HQ * D, HKV * sizeof(float),
++                              (size_t) HKV * D * sizeof(float), (size_t) n_q_pad * HQ * sizeof(float),
++                              (size_t) HKV * (D / 32) * sizeof(unsigned int), (size_t) HKV * (D / 32) * sizeof(unsigned int),
++                              (size_t) ns * n_q_pad * HQ * D * sizeof(half), (size_t) ns * n_q_pad * HQ * sizeof(float2),
++                              (derived ? (size_t) nkv / LF_KT : 1) * sizeof(int2) };
++        size_t t = 0;
++        for (int i = 0; i < 11; ++i) { if (out) out[i] = sz[i]; t += lf_fa_align(sz[i]); }
++        return t;
++    };
++    const size_t want = layout_bytes(n_kv_cap, LF_MAXSPLIT, nullptr);
++    size_t sizes[11];
++    const size_t total = layout_bytes(n_kv_pad, nsplit, sizes);
++    char * scratch = lf_fa_arena_get(stream, total, want);
++    ggml_cuda_pool_alloc<char> fallback(pool);
++    if (scratch == nullptr) scratch = fallback.alloc(total);
++    char * cur = scratch;
++    auto carve = [&](const size_t b) { char * r = cur; cur += lf_fa_align(b); return r; };
++    uint8_t      * k8    = (uint8_t *)      carve(sizes[0]);
++    uint8_t      * v8t   = (uint8_t *)      carve(sizes[1]);
++    uint8_t      * q8    = (uint8_t *)      carve(sizes[2]);
++    float        * ks    = (float *)        carve(sizes[3]);
++    float        * vs    = (float *)        carve(sizes[4]);
++    float        * qs    = (float *)        carve(sizes[5]);
++    unsigned int * vbits = (unsigned int *) carve(sizes[6]);
++    unsigned int * kbits = (unsigned int *) carve(sizes[7]);
++    half         * part  = (half *)         carve(sizes[8]);
++    float2       * ml    = (float2 *)       carve(sizes[9]);
++    int2         * trange = (int2 *)        carve(sizes[10]);
++
++    CUDA_CHECK(cudaMemsetAsync(kbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));
++    lf_fa_conv_v_amax<D><<<dim3(HKV, (n_kv + 255) / 256), 256, 0, stream>>>((const char *) K->data, K->nb[1], K->nb[2], n_kv, kbits);
++    lf_fa_conv_k<D><<<dim3((n_kv_pad + 7) / 8, HKV), 256, 0, stream>>>((const char *) K->data, K->nb[1], K->nb[2], n_kv, n_kv_pad, kbits, k8, ks);
++    CUDA_CHECK(cudaMemsetAsync(vbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));
++    lf_fa_conv_v_amax<D><<<dim3(HKV, (n_kv + 255) / 256), 256, 0, stream>>>((const char *) V->data, V->nb[1], V->nb[2], n_kv, vbits);
++    lf_fa_conv_v_scale<D><<<HKV, D, 0, stream>>>(vbits, vs);
++    lf_fa_conv_v<D><<<dim3(n_kv_pad / 64, HKV), D, 0, stream>>>((const char *) V->data, V->nb[1], V->nb[2], n_kv, n_kv_pad, vs, v8t);
++    lf_fa_conv_q<D><<<dim3(n_q_pad / 8, HQ), 256, 0, stream>>>((const char *) Q->data, Q->nb[1], Q->nb[2], n_q, n_q_pad, HQ, q8, qs);
++
++    const int   * cell_pos = derived ? (const int *) dst->src[5]->data : nullptr;
++    const int   * tok_lo   = derived ? (const int *) dst->src[6]->data : nullptr;
++    const int   * tok_hi   = derived ? (const int *) dst->src[7]->data : nullptr;
++    const char  * mdata    = !derived && mask ? (const char *) mask->data : nullptr;
++    const int64_t nb31     = !derived && mask ? mask->nb[1] : 0;
++    const float scale_log2 = scale * 1.4426950408889634f;
++    if (derived) lf_fa_tile_range<<<ntile, LF_KT, 0, stream>>>(cell_pos, n_kv, trange);
++    const dim3 grid(n_q_pad / LF_QB, HKV, nsplit);
++#define LF_FA_LAUNCH(g) lf_fa_attn<g, D><<<grid, (g) * 32, 0, stream>>>(q8, qs, k8, ks, v8t, vs, \
++        cell_pos, tok_lo, tok_hi, trange, mdata, nb31, part, ml, n_q, n_q_pad, n_kv, n_kv_pad, scale_log2)
++    switch (G) {
++        case 1: LF_FA_LAUNCH(1); break;
++        case 2: LF_FA_LAUNCH(2); break;
++        case 3: LF_FA_LAUNCH(3); break;
++        case 4: LF_FA_LAUNCH(4); break;
++        case 5: LF_FA_LAUNCH(5); break;
++        case 6: LF_FA_LAUNCH(6); break;
++        case 7: LF_FA_LAUNCH(7); break;
++        case 8: LF_FA_LAUNCH(8); break;
++        default: GGML_ABORT("lf_fa_fp8: unsupported GQA ratio %d", G);
++    }
++#undef LF_FA_LAUNCH
++    // dst is [D, HQ, n_q] contiguous: rows t*HQ + h
++    lf_fa_combine<D><<<n_q * HQ, D, 0, stream>>>(part, ml, (float *) dst->data, n_q_pad, HQ, nsplit);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace
++
++bool ggml_cuda_lf_fa_fp8_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
++    if (!lf_on()) return false;
++    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
++    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) return false;
++    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || dst->type != GGML_TYPE_F32) return false;
++    const int64_t D = K->ne[0];
++    if ((D != 64 && D != 128 && D != 256) || Q->ne[0] != D || V->ne[0] != D) return false;
++    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2]) return false;
++    if (K->ne[1] < lf_min_kv()) return false;
++    if (Q->ne[1] < lf_min_t() || Q->nb[0] != sizeof(float) || Q->nb[1] % 16 != 0 || Q->nb[2] % 16 != 0) return false;
++    if ((uintptr_t) Q->data % 16 != 0) return false;
++    const int64_t HQ = Q->ne[2], HKV = K->ne[2];
++    if (HKV <= 0 || HQ % HKV != 0) return false;
++    const int64_t G = HQ / HKV;
++    if (G < 1 || G > 8) return false;
++    if (D == 256 && G == 1) return false;   // 32-thread blocks at head 256 spill registers
++    if (V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs))) return false;
++    if (dst->src[4] != nullptr) return false; // sinks
++    float max_bias, softcap;
++    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
++    if (max_bias != 0.f || softcap != 0.f) return false;
++    const bool derived = dst->src[5] != nullptr;
++    if (!derived && mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[0] < K->ne[1])) return false;
++    if (!ggml_is_contiguous(dst)) return false;
++    return true;
++}
++
++void ggml_cuda_lf_fa_fp8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    switch (dst->src[1]->ne[0]) {
++        case  64: lf_fa_run< 64>(ctx, dst); break;
++        case 128: lf_fa_run<128>(ctx, dst); break;
++        case 256: lf_fa_run<256>(ctx, dst); break;
++        default: GGML_ABORT("lf_fa_fp8: unsupported head size %lld", (long long) dst->src[1]->ne[0]);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cuh b/ggml/src/ggml-cuda/lf-fa-fp8.cuh
+new file mode 100644
+index 000000000..9803bdfae
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lf-fa-fp8.cuh
+@@ -0,0 +1,12 @@
++#pragma once
++#include "common.cuh"
++// Llama-Frankenstein: FP8 flash attention for RDNA4 prefill (written by Claude).
++// GGML_LF_FA_FP8=1 turns it on (unset: off, nothing changes); GGML_LF_FA_FP8_MIN_T (default 32) is the smallest
++// token count it takes, so decode / speculative verify keep their kernels; GGML_LF_FA_FP8_MIN_KV (default 512) the
++// smallest KV length.
++// Head 64 / 128 / 256, GQA 1..8.  The q8_0 K/V cache stays as it is; each call converts it to fp8 e4m3 (K: one scale per token and head, V: transposed,
++// one scale per channel) the way the f16 path converts it to f16, Q gets one scale per token and head, and
++// S^T = K Q^T and O^T += V^T P^T run on v_wmma_f32_16x16x16_fp8_fp8 (P scaled by 2^8).  Results differ from the
++// f16 path (fp8 rounding of Q, K, V and P).
++bool ggml_cuda_lf_fa_fp8_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
++void ggml_cuda_lf_fa_fp8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
