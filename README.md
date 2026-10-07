@@ -8,11 +8,11 @@ Patches only; MIT.  Written with Claude (AI).
 
 File names: `<serial>-<upstream base>-<name>-v<version>.patch`.
 
-| patch | what | turn on | lossy | needs |
+| patch | what | turn on | type | needs |
 |---|---|---|---|---|
-| `0001-a55-k1-v2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | yes | hipBLASLt |
-| `0002-a55-f8-v3.1` | prefill flash attention in fp8 | `GGML_LF_FA_FP8=1` | yes | — |
-| `0003-a55-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | yes | 0001 |
+| `0001-a55-k1-v2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
+| `0002-a55-f8-v3.1` | prefill flash attention in fp8 | `GGML_LF_FA_FP8=1` | lossy | — |
+| `0003-a55-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | lossy | 0001 |
 
 All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt:
 
@@ -35,14 +35,15 @@ Decode is unchanged.
 
 ## History
 
-Each entry: the patch set of that date and its speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux);
-the linked report has the setup and the KLD.
+Speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux), tokens/s.  Each entry: plain rdna-boosts, then
+with this repo's patches, all on.  The report has the setup and the KLD.
 
-| date | patch set | Q5 (UD-Q5_K_M) prefill / decode t/s | MXFP4 prefill / decode t/s | report |
-|---|---|---|---|---|
-| 2026-10-07 | 0001-0003 (a55, v2) on `v16-a55e952b8-r8` | 983 → **1972** / 47.4 → 47.5 | 1151 → **2402** / 54.7 → 63.0 | [2026-10-07](reports/2026-10-07.md) |
+| date | build | Q5 prefill | Q5 decode | MXFP4 prefill | MXFP4 decode | report |
+|---|---|---|---|---|---|---|
+| 2026-10-07 | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 | [link](reports/2026-10-07.md) |
+| | + K1 v2, F8 v3.1, M4 v2 | **1958** | 47.5 | **2393** | **63.0** | |
 
-`a → b`: plain rdna-boosts → all speed-ups on.
+Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
 ## Build
 
