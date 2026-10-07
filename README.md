@@ -36,12 +36,12 @@ Decode is unchanged.
 ## History
 
 Speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux), tokens/s.  Each entry: plain rdna-boosts, then
-with this repo's patches, all on.  The report has the setup and the KLD.
+with this repo's patches, all on.  The date links to the report (setup and KLD).
 
-| date | build | Q5 prefill | Q5 decode | MXFP4 prefill | MXFP4 decode | report |
-|---|---|---|---|---|---|---|
-| 2026-10-07 | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 | [link](reports/2026-10-07.md) |
-| | + K1 v2, F8 v3.1, M4 v2 | **1958** | 47.5 | **2393** | **63.0** | |
+| date | build | Q5 prefill | Q5 decode | MXFP4 prefill | MXFP4 decode |
+|---|---|---|---|---|---|
+| [2026&#8209;10&#8209;07](reports/2026-10-07.md) | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 |
+| | + K1&nbsp;v2, F8&nbsp;v3.1, M4&nbsp;v2 | **1958** | 47.5 | **2393** | **63.0** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
