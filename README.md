@@ -33,6 +33,17 @@ Decode is unchanged.
 - **Apply cleanly:** `v16-a55e952b8-r10`, `v16-a55e952b8-r15` (not built or run).  Other `v16-a55e952b8-rN` releases share the base and
   should work: check with `git apply --check` first.  A new upstream base (a different `v16-<hash>`) needs a new patch set.
 
+## History
+
+Each entry: the patch set of that date and its speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux);
+the linked report has the setup and the KLD.
+
+| date | patch set | Q5 (UD-Q5_K_M) prefill / decode t/s | MXFP4 prefill / decode t/s | report |
+|---|---|---|---|---|
+| 2026-10-07 | 0001-0003 (a55, v2) on `v16-a55e952b8-r8` | 983 → **1972** / 47.4 → 47.5 | 1151 → **2402** / 54.7 → 63.0 | [2026-10-07](reports/2026-10-07.md) |
+
+`a → b`: plain rdna-boosts → all speed-ups on.
+
 ## Build
 
 - [Linux](BUILD-linux.md)
