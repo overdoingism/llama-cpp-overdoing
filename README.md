@@ -11,7 +11,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.
 | patch | what | turn on | lossy | needs |
 |---|---|---|---|---|
 | `0001-a55-k1-v2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | yes | hipBLASLt |
-| `0002-a55-f8-v2` | prefill flash attention in fp8 | `GGML_LF_FA_FP8=1` | yes | — |
+| `0002-a55-f8-v3.1` | prefill flash attention in fp8 | `GGML_LF_FA_FP8=1` | yes | — |
 | `0003-a55-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | yes | 0001 |
 
 All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt:
