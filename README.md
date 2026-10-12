@@ -10,8 +10,8 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.
 
 | patch | what | turn on | type | needs |
 |---|---|---|---|---|
-| `0001-a55-k1-v2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
-| `0002-a55-f8-v3.1` | prefill flash attention in fp8 | `GGML_LF_FA_FP8=1` | lossy | — |
+| `0001-a55-k1-v3` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8; fp8 corrects the largest activation channels) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
+| `0002-a55-f8-v3.2` | prefill flash attention in fp8 (and no growing F16 staging copy) | `GGML_LF_FA_FP8=1` | lossy | — |
 | `0003-a55-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | lossy | 0001 |
 
 All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt:
@@ -20,11 +20,13 @@ All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B U
 |---|---|---|
 | reference (no patch) | — | 0.0018 / 0.0006 (run-to-run floor) |
 | K1 f16 | +14% / +15% | ≈ floor |
-| K1 fp8 (on top of f16) | +16% / +22% | 0.0027 / 0.0010 |
+| K1 fp8 (on top of f16) | +16% / +22% | 0.0023 / 0.0008 |
 | F8 | +3% / +17% | 0.0020 / 0.0007 |
 | M4 (MXFP4 models only) | +55% at 8K, +44% at 110K | +≈0.001 over the MXFP4 weights themselves |
 
-Decode is unchanged.
+Decode is unchanged.  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
+2-3% for Chinese text and 0.1-0.3% for English; generation reads the prompt through the KV cache and sees far less (the KLD column).
+For prompt-scoring workloads use `f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
 
 ## Switches
 
@@ -33,7 +35,9 @@ Every switch, its values, and the server parameters it needs: [SWITCHES.md](SWIT
 ## Applicable versions
 
 - **Tested:** rdna-boosts `v16-a55e952b8-r8`: these three apply and build on the plain release; the numbers above come from a build
-  that also had two bit-identical patches since sent to rdna-boosts.
+  that also had bit-identical patches since sent to rdna-boosts.
+- **r45:** `0001` has one conflicting hunk in `ggml/src/ggml-cuda/ggml-cuda.cu` (start of graph compute: keep both rdna-boosts'
+  `bf16_src1_cache_clear()` line and K1's `graph_begin` line); then it builds and gives the same output as on r8.
 - **Apply cleanly:** `v16-a55e952b8-r10`, `v16-a55e952b8-r15` (not built or run).  Other `v16-a55e952b8-rN` releases share the base and
   should work: check with `git apply --check` first.  A new upstream base (a different `v16-<hash>`) needs a new patch set.
 
@@ -46,6 +50,7 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 |---|---|---|---|---|---|
 | original | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 |
 | [2026&#8209;10&#8209;07](reports/2026-10-07.md) | + K1&nbsp;v2, F8&nbsp;v3.1, M4&nbsp;v2 | **1958** | 47.5 | **2393** | **63.0** |
+| [2026&#8209;10&#8209;12](reports/2026-10-12.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1954** | 49.0 | **2388** | **62.9** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 

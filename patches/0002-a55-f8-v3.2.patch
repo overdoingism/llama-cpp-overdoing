@@ -1,3 +1,25 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b5bc8a3a7..f12f50be2 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1535,9 +1535,17 @@ struct ggml_cuda_graph_key_hash {
+ // The per-operand cap GGML_CUDA_FA_STAGE_MAX_MB resolves to (0 = unbounded): a staging request
+ // larger than this is not staged at all.  Shared by launch_fattn and the --fit accounting of the
+ // staging arena (ggml_backend_cuda_fattn_stage_bound).
++// With the fp8 prefill attention on (GGML_LF_FA_FP8) the default is 1 MiB: a batch of 32 or more tokens goes to it and
++// never stages, and the ones it declines (9-31 tokens) read the q8_0 cache directly at the same speed and with the same
++// result, instead of growing a whole-prefix F16 copy that is never freed (the arena sits outside --fit, and on Windows a
++// device allocation does not fail when VRAM runs out but lands in shared memory).  An explicit setting still wins.
+ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
+     static const size_t stage_max_bytes = []() {
+         const char * e = getenv("GGML_CUDA_FA_STAGE_MAX_MB");
++        const char * f = getenv("GGML_LF_FA_FP8");
++        if (e == nullptr && f != nullptr && atoi(f) != 0) {
++            return (size_t) 1 << 20;
++        }
+         return (size_t) (e ? atoll(e) : 512) << 20;
+     }();
+     return stage_max_bytes;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
 index 4d2e71803..27f1bd969 100644
 --- a/ggml/src/ggml-cuda/fattn.cu

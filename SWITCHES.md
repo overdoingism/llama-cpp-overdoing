@@ -9,6 +9,7 @@ command in bash, `$env:NAME = "value"` in PowerShell); to turn one off, unset it
 | variable | patch | values | what it does |
 |---|---|---|---|
 | `GGML_LF_KQ_BLAS` | 0001 K1 | `f16`, `fp8` | Prefill matmuls of quantized weights (not MXFP4; dense layers, not MoE experts) through hipBLASLt.  `f16`: weights converted to f16, KLD at the floor.  `fp8`: weights and activations in fp8, faster, a little more error.  Only batches of 1024 tokens or more, so it needs `-ub` ≥ 1024. |
+| `GGML_LF_KQ_BLAS_FP8_KEEP` | 0001 K1 | a number, default `64`; `0` = off | K1 `fp8` only (v3): per input batch, the channels with the largest activations (64 by default; up to 248, rounded up to a multiple of 8) get a second fp8 term for their weight and activation rounding errors, appended to the same GEMM.  About half of the fp8 error above `f16` goes away for about 1% of prefill speed.  `0` gives exactly the v2 output. |
 | `GGML_LF_DRAFT_UB` | 0001 K1 | a number, e.g. `512` | Caps the draft model's ubatch (only ever lowers it).  With `-ub 2048`, `512` saves about 0.7 GiB of VRAM. |
 | `GGML_LF_FA_FP8` | 0002 F8 | `1` | Prefill flash attention in fp8.  Runs only with `-fa on` and a q8_0 KV cache (`-ctk q8_0 -ctv q8_0`), on batches of 32 tokens or more over 512 or more KV cells. |
 | `GGML_LF_MXFP4_DIRECT` | 0003 M4 | `blaslt` | MXFP4 weights only: prefill converts them exactly to fp8 and runs 0001's fp8 GEMM (`GGML_LF_KQ_BLAS` does not have to be set).  Batches of 64 tokens or more.  (`fp8` and `f16` select older kernels, a little slower.) |
@@ -55,6 +56,7 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 
 | variable | what it does |
 |---|---|
+| `GGML_CUDA_FA_STAGE_MAX_MB` | rdna-boosts: cap (MiB) of the flash-attention F16 staging copy, which only grows.  With 0002 F8 on and the variable unset, 0002 sets it to 1: the batches F8 does not take (9-31 tokens) then read the q8_0 cache directly, same result and speed, and the copy (about 1.2 GB at 240K context; on Windows it ends up in shared memory) is never made.  An explicit value still wins; `0` means no cap. |
 | `GGML_LF_DFLASH_DEV=1` | rdna-boosts (F1): with a DFlash draft (`--spec-type draft-dflash`) and one sequence, the target model's features stay on the GPU. |
 | `HIPBLASLT_TENSILE_LIBPATH` | hipBLASLt's own: where its kernels are.  See the build guides. |
 
@@ -69,6 +71,7 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 | 變數 | patch | 值 | 作用 |
 |---|---|---|---|
 | `GGML_LF_KQ_BLAS` | 0001 K1 | `f16`、`fp8` | 量化權重（MXFP4 除外；只有一般的矩陣乘，不含 MoE 專家）的 prefill 矩陣乘改走 hipBLASLt。`f16`：權重轉 f16，KLD 與底噪相同。`fp8`：權重與 activation 都轉 fp8，更快、誤差稍大。只處理 1024 token 以上的批次，所以 `-ub` 要 ≥ 1024。 |
+| `GGML_LF_KQ_BLAS_FP8_KEEP` | 0001 K1 | 數字，預設 `64`；`0` 為關 | 只對 K1 `fp8`（v3）：每個輸入批次挑出 activation 最大的通道（預設 64 個，最多 248，取 8 的倍數），把這些通道的權重與 activation 的 fp8 捨入誤差，當成第二個 fp8 項接在同一次矩陣乘裡。fp8 比 `f16` 多出的誤差約減半，prefill 約慢 1%。`0` 的輸出和 v2 完全相同。 |
 | `GGML_LF_DRAFT_UB` | 0001 K1 | 數字，例如 `512` | 限制草稿模型的 ubatch（只會調小）。`-ub 2048` 時設 `512` 約省 0.7 GiB 顯存。 |
 | `GGML_LF_FA_FP8` | 0002 F8 | `1` | prefill 的 flash attention 改用 fp8。只在 `-fa on` 且 KV 快取為 q8_0（`-ctk q8_0 -ctv q8_0`）時作用，批次 32 token 以上、KV 512 格以上。 |
 | `GGML_LF_MXFP4_DIRECT` | 0003 M4 | `blaslt` | 只對 MXFP4 權重：prefill 時把權重精確轉成 fp8，用 0001 的 fp8 矩陣乘（不必另設 `GGML_LF_KQ_BLAS`）。批次 64 token 以上。（`fp8`、`f16` 是較舊的 kernel，稍慢。） |
@@ -108,5 +111,6 @@ decode 與草稿驗證不受影響：它們的批次都低於上面的下限。
 
 | 變數 | 作用 |
 |---|---|
+| `GGML_CUDA_FA_STAGE_MAX_MB` | rdna-boosts 的變數：flash attention F16 暫存複本的上限（MiB），這個暫存區只增不減。開 0002 F8 且沒設這個變數時，0002 把它設成 1：F8 不接手的批次（9～31 token）改直接讀 q8_0 快取，結果和速度相同，也不會產生那份複本（24 萬上下文約 1.2 GB；Windows 上會落到共用記憶體）。明確設定時以設定為準；`0` 表示不設上限。 |
 | `GGML_LF_DFLASH_DEV=1` | rdna-boosts 的 F1：使用 DFlash 草稿（`--spec-type draft-dflash`）且只有一個序列時，目標模型的特徵留在 GPU 上。 |
 | `HIPBLASLT_TENSILE_LIBPATH` | hipBLASLt 自己的變數：kernel 的位置，見編譯說明。 |
