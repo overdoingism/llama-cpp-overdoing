@@ -16,7 +16,7 @@ files are the same patches for the previous base (`v16-a55e952b8-rN`).
 | `0003-097-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | lossy | 0001 |
 
 All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt, on
-`v16-a55e952b8-r8` (the patch code is the same on r50; speeds on r50 are in History, KLD was not measured again):
+`v16-a55e952b8-r8` (the patch code is the same on r50; speeds on r50 are in History, the quality check on r50 is in its report):
 
 | | prefill | KLD vs official UD-Q5_K_M (zh / en) |
 |---|---|---|
