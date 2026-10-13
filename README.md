@@ -54,10 +54,10 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 | original | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 |
 | [2026&#8209;10&#8209;07](reports/2026-10-07.md) | + K1&nbsp;v2, F8&nbsp;v3.1, M4&nbsp;v2 | **1958** | 47.5 | **2393** | **63.0** |
 | [2026&#8209;10&#8209;12](reports/2026-10-12.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1954** | 49.0 | **2388** | **62.9** |
-| original | `v16-097cf33d9-r50` | 1124 | 50.8 | — | — |
+| original | `v16-097cf33d9-r50` | 1124 | 50.8 | 1344 | 60.8 |
 | [2026&#8209;10&#8209;13](reports/2026-10-13.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1959** | 50.6 | **2397** | **66.2** |
 
-Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.  `—`: not measured.
+Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
 ## Build
 
