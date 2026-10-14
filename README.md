@@ -1,8 +1,8 @@
 # llama-cpp-overdoing
 
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
-for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, and one opt-in guard against replies that end
-inside the reasoning.  Bit-identical work goes to rdna-boosts itself.
+for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, an opt-in guard against replies that end
+inside the reasoning, and fixes of upstream llama.cpp code that we keep here.  Other bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
 ## Patches
@@ -13,10 +13,13 @@ the previous base (`v16-a55e952b8-rN`).
 
 | patch | what | turn on | type | needs |
 |---|---|---|---|---|
-| `0001-097-k1-v3.2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8; fp8 corrects the largest activation channels) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
-| `0002-097-f8-v3.3` | prefill flash attention in fp8 (and no growing F16 staging copy) | `GGML_LF_FA_FP8=1` | lossy | — |
-| `0003-097-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | lossy | 0001 |
+| `0001-097-k1-v3.2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8; fp8 corrects the largest activation channels) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | speed/lossy | hipBLASLt |
+| `0002-097-f8-v3.3` | prefill flash attention in fp8 (and no growing F16 staging copy) | `GGML_LF_FA_FP8=1` | speed/lossy | — |
+| `0003-097-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | speed/lossy | 0001 |
 | `0004-097-reasoning-guard-v1` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts) | `LLAMA_REASONING_GUARD=1` | guard | — |
+| `0005-097-backend-sampling-reserve-v1` | with `--backend-sampling`, the compute buffers are reserved once per sequence instead of being freed and allocated again for every request (upstream llama.cpp behavior; about 0.25 s per request on a 27B model at `-ub 2048`) | always on | fix | — |
+
+**2026-10-15 (later):** new `0005`, a fix for `--backend-sampling`: llama.cpp re-reserved the compute graph on every request, freeing and allocating all compute buffers again.  Same output; see the [report](reports/2026-10-15.md#backend-sampling-fix-0005).
 
 **2026-10-15:** support for rdna-boosts r51 and later (tested r59; on r59 the outputs equal r50's).  K1 v3.2 converts the weights to fp8 in one step: same output as v3, about 12% faster prefill.  New `0004`: the reasoning guard (off unless set).  When it fires, the model writes its answer a second time after the reasoning: leave room in `max_tokens`.
 
