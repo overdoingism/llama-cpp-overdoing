@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 63ecfa903..62316fbad 100644
+index 1d255b749..9af8bf049 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1610,9 +1610,17 @@ void   ggml_cuda_slab_ring_set(int device, bool arm);
+@@ -1618,9 +1618,17 @@ void   ggml_cuda_slab_ring_set(int device, bool arm);
  // The per-operand cap GGML_CUDA_FA_STAGE_MAX_MB resolves to (0 = unbounded): a staging request
  // larger than this is not staged at all.  Shared by launch_fattn and the --fit accounting of the
  // staging arena (ggml_backend_cuda_fattn_stage_bound).

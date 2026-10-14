@@ -9,7 +9,7 @@ git config --global core.autocrlf false        # before cloning: patches need LF
 git clone https://github.com/ggml-org/llama.cpp; cd llama.cpp
 git checkout 097cf33d9
 git clone https://github.com/stew675/llama-cpp-rdna-boosts ..\rdna-boosts
-git -C ..\rdna-boosts checkout v16-097cf33d9-r50     # r50 only: r51 and later are not supported yet
+git -C ..\rdna-boosts checkout v12-097cf33d9-r59     # r51 and later; for v16-097cf33d9-r50 use patches\r50\
 bash ../rdna-boosts/scripts/apply-all.sh .            # Git for Windows bash; makes branch rdna-boosts
 Get-ChildItem C:\path\to\llama-cpp-overdoing\patches\0*-097-*.patch | Sort-Object Name | ForEach-Object { git apply --check $_.FullName; if ($?) { git apply $_.FullName } }
 $root = "C:\path\to\_rocm_sdk_devel"
@@ -21,9 +21,10 @@ $k = Get-ChildItem (Split-Path $root) -Recurse -Directory -Filter gfx1201 | Wher
 Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201, next to llama-server.exe
 ```
 
-- Apply in number order (0003 needs 0001).  The patches add `.cu` files: after applying, always run the configure step again.
-- For a `v16-a55e952b8-rN` release, check out `a55e952b8` and use the `0*-a55-*` files instead.
-- On r50 the configure step may log `UI: download dist.tar.gz... failed` (it tries to fetch the web UI); harmless, the build
+- Apply in number order (0003 needs 0001; 0004 stands alone).  The patches add `.cu` files: after applying, always run the configure step again.
+- For r50, use the files in `patches/r50/` (plus the top-level `0004` if wanted).  For a `v16-a55e952b8-rN` release, check out
+  `a55e952b8` and use `patches/a55/`.
+- The configure step may log `UI: download dist.tar.gz... failed` (it tries to fetch the web UI); harmless, the build
   works offline, and `llama-server --no-webui` does not need it.
 - **Keep `GGML_HIP_NO_VMM=ON`** (default).  With `OFF`, a long context overflows into shared GPU memory on Windows and prefill drops
   to about a quarter.  Keep `GGML_HIP_LF_HIPBLASLT=ON` (default).
@@ -43,8 +44,8 @@ Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201,
 給 AI 助理看。需要 Windows 版 ROCm SDK（TheRock 的 `_rocm_sdk_devel`，含 hipBLASLt）、Ninja、Git for Windows（提供 `bash`）；GPU 為 gfx1201。在 PowerShell 操作。
 
 1. **clone 之前**先設 `git config --global core.autocrlf false`，patch 需要 LF 換行。
-2. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `097cf33d9`；clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v16-097cf33d9-r50`（r51 以後尚未支援；舊基底 `v16-a55e952b8-rN` 要 checkout `a55e952b8`，改用 `0*-a55-*` 的 patch），用 Git for Windows 的 `bash` 在 llama.cpp 目錄執行 `apply-all.sh .`。
-3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。r50 設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
+2. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `097cf33d9`；clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v12-097cf33d9-r59`（r51 以後皆可；r50 改用 `patches/r50/`；舊基底 `v16-a55e952b8-rN` 要 checkout `a55e952b8`，改用 `patches/a55/`），用 Git for Windows 的 `bash` 在 llama.cpp 目錄執行 `apply-all.sh .`。
+3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0004 可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
 4. cmake 用 Ninja，`-DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON`，編譯器與 `CMAKE_PREFIX_PATH` 指向 ROCm SDK（見上方指令）。
 5. **`GGML_HIP_NO_VMM` 一定要保持 ON**：設成 OFF 時，長上下文會溢出到共用 GPU 記憶體，prefill 掉到約四分之一。`GGML_HIP_LF_HIPBLASLT` 保持預設 ON。
 6. 編 `llama-server`。

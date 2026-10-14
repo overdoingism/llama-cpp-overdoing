@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1594d54d8..bc8612d59 100644
+index f29e362eb..b1b2e22db 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -21,6 +21,7 @@
@@ -10,7 +10,7 @@ index 1594d54d8..bc8612d59 100644
  #include "ggml-cuda/count-equal.cuh"
  #include "ggml-cuda/cpy.cuh"
  #include "ggml-cuda/cross-entropy-loss.cuh"
-@@ -3955,7 +3956,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -2930,7 +2931,7 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
      }
  
      // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes these matmuls unfused
@@ -19,7 +19,7 @@ index 1594d54d8..bc8612d59 100644
          return false;
      }
  
-@@ -4152,6 +4153,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -3000,6 +3001,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          ggml_cuda_lf_kq_blas_mul_mat(ctx, src0, src1, dst);
          return;
      }
@@ -31,25 +31,7 @@ index 1594d54d8..bc8612d59 100644
  
      // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
      // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
-@@ -6858,7 +6864,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-             ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
-             : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
-     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes dense pairs unfused
--    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && ggml_cuda_lf_kq_blas_will_take(node);
-+    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && (ggml_cuda_lf_kq_blas_will_take(node) || ggml_cuda_lf_mxfp4_will_take(node));
-     if (!pair_off && !mmb_pair_taken && !lf_kq_pair_taken && (node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) && i + 1 < cgraph->n_nodes) {
-         ggml_tensor * next = cgraph->nodes[i + 1];
-         const ggml_tensor * src0 = node->src[0];
-@@ -7122,7 +7128,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-             node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
-             a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
-         // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes the down projection unfused
--        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) &&
-+        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) && !ggml_cuda_lf_mxfp4_will_take(next) &&
-                 ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
-                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
-             ggml_cuda_mul_mat_q_swiglu_dense(*cuda_ctx, next->src[0], next, node);
-@@ -9268,6 +9274,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4453,6 +4459,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      cuda_ctx->q8_1_cache_clear();
      cuda_ctx->bf16_src1_cache_clear();
      ggml_cuda_lf_kq_blas_graph_begin();
@@ -861,3 +843,33 @@ index 000000000..4f8d04945
 +void ggml_cuda_lf_mxfp4_graph_begin();
 +// the fusions that would take an MXFP4 prefill matmul (dense gate+up pair, swiglu -> mmq down) stand down for this path
 +bool ggml_cuda_lf_mxfp4_will_take(const ggml_tensor * mm);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index e8542ff9a..9b4b0a644 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -5,6 +5,7 @@
+ #include "quantize.cuh"
+ #include "mmid.cuh"
+ #include "lf-kq-blas.cuh"   // Llama-Frankenstein K1
++#include "lf-mxfp4.cuh"     // Llama-Frankenstein M4
+ 
+ #include <cstdint>
+ 
+@@ -855,7 +856,7 @@ int ggml_cuda_mul_mat_q_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggm
+             ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
+             : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
+     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes dense pairs unfused
+-    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && ggml_cuda_lf_kq_blas_will_take(node);
++    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && (ggml_cuda_lf_kq_blas_will_take(node) || ggml_cuda_lf_mxfp4_will_take(node));
+     if (pair_off || mmb_pair_taken || lf_kq_pair_taken ||
+             !(node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) ||
+             i + 1 >= cgraph->n_nodes) {
+@@ -967,7 +968,7 @@ int ggml_cuda_mul_mat_q_swiglu_dense_try_fuse(ggml_backend_cuda_context & ctx, c
+         node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
+         a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
+     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes the down projection unfused
+-    if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) &&
++    if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) && !ggml_cuda_lf_mxfp4_will_take(next) &&
+             ggml_cuda_mul_mat_takes_mmq(ctx, next->src[0], node, next) &&
+             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+         ggml_cuda_mul_mat_q_swiglu_dense(ctx, next->src[0], next, node);

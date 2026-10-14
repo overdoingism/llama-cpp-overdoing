@@ -1,19 +1,24 @@
 # llama-cpp-overdoing
 
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
-for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups.  Bit-identical work goes to rdna-boosts itself.
+for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, and one opt-in guard against replies that end
+inside the reasoning.  Bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
 ## Patches
 
-File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  Current base: `097` (rdna-boosts `v16-097cf33d9-rN`); the `a55`
-files are the same patches for the previous base (`v16-a55e952b8-rN`).
+File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `patches/` are for rdna-boosts
+`v12-097cf33d9-r51` and later (tested on r59); `patches/r50/` holds the set for `v16-097cf33d9-r50`, and `patches/a55/` the set for
+the previous base (`v16-a55e952b8-rN`).
 
 | patch | what | turn on | type | needs |
 |---|---|---|---|---|
-| `0001-097-k1-v3` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8; fp8 corrects the largest activation channels) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
+| `0001-097-k1-v3.2` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8; fp8 corrects the largest activation channels) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
 | `0002-097-f8-v3.3` | prefill flash attention in fp8 (and no growing F16 staging copy) | `GGML_LF_FA_FP8=1` | lossy | — |
 | `0003-097-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | lossy | 0001 |
+| `0004-097-reasoning-guard-v1` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts) | `LLAMA_REASONING_GUARD=1` | guard | — |
+
+**2026-10-15:** support for rdna-boosts r51 and later (tested r59; on r59 the outputs equal r50's).  K1 v3.2 converts the weights to fp8 in one step: same output as v3, about 12% faster prefill.  New `0004`: the reasoning guard (off unless set).  When it fires, the model writes its answer a second time after the reasoning: leave room in `max_tokens`.
 
 **2026-10-14:** `0002` F8 v3.3 fixes prompts prefilled together in one batch (`--parallel` ≥ 2): v3.1 and v3.2 zeroed the other sequences' attention in the F8 layers.  One sequence gives the same output as v3.2.  The `a55` file still has the bug: use `--parallel 1` with it.
 
@@ -38,10 +43,12 @@ Every switch, its values, and the server parameters it needs: [SWITCHES.md](SWIT
 
 ## Applicable versions
 
-- **`097` files, tested:** rdna-boosts `v16-097cf33d9-r50`.  They apply in number order on the plain release, build, and give the
-  History numbers.  Use that release: r51 and later (tagged `v12-097cf33d9-rN`) reorganized the sources, and `0001` does not
-  apply there; they are not supported yet.
-- **`a55` files:** `v16-a55e952b8-r8` tested (the Patches table and the first History rows; that build also had bit-identical
+- **`patches/0*-097-*`, tested:** rdna-boosts `v12-097cf33d9-r59`.  They apply in number order on the plain release, build, and
+  give the History numbers; they also apply on r56.  Other releases from r51 on share the source layout: check with
+  `git apply --check` first.
+- **`patches/r50/`:** for `v16-097cf33d9-r50` (r51 reorganized the sources; the top-level `0001` and `0003` do not apply to r50).
+  K1 v3 there.  The top-level `0004` applies to r50 as well (it only changes `common/sampling.cpp`).
+- **`patches/a55/`:** `v16-a55e952b8-r8` tested (the Patches table and the first History rows; that build also had bit-identical
   patches since sent to rdna-boosts).  On r45 and later, `0001` has one conflicting hunk in
   `ggml/src/ggml-cuda/ggml-cuda.cu` (start of graph compute: keep both rdna-boosts' `bf16_src1_cache_clear()` line and K1's
   `graph_begin` line).
@@ -59,6 +66,8 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 | [2026&#8209;10&#8209;12](reports/2026-10-12.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1954** | 49.0 | **2388** | **62.9** |
 | original | `v16-097cf33d9-r50` | 1124 | 50.8 | 1344 | 60.8 |
 | [2026&#8209;10&#8209;13](reports/2026-10-13.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1959** | 50.6 | **2397** | **66.2** |
+| original | `v12-097cf33d9-r59` | 1125 | 51.1 | 1335 | 60.0 |
+| 2026&#8209;10&#8209;15 | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2 | **2197** | 50.4 | **2365** | **66.2** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 

@@ -13,6 +13,7 @@ command in bash, `$env:NAME = "value"` in PowerShell); to turn one off, unset it
 | `GGML_LF_DRAFT_UB` | 0001 K1 | a number, e.g. `512` | Caps the draft model's ubatch (only ever lowers it).  With `-ub 2048`, `512` saves about 0.7 GiB of VRAM. |
 | `GGML_LF_FA_FP8` | 0002 F8 | `1` | Prefill flash attention in fp8.  Runs only with `-fa on` and a q8_0 KV cache (`-ctk q8_0 -ctv q8_0`), on batches of 32 tokens or more over 512 or more KV cells. |
 | `GGML_LF_MXFP4_DIRECT` | 0003 M4 | `blaslt` | MXFP4 weights only: prefill converts them exactly to fp8 and runs 0001's fp8 GEMM (`GGML_LF_KQ_BLAS` does not have to be set).  Batches of 64 tokens or more.  (`fp8` and `f16` select older kernels, a little slower.) |
+| `LLAMA_REASONING_GUARD` | 0004 | `1` | When the model samples an end of turn inside its reasoning block, the block's end tag (`</think>`) is emitted instead and generation goes on, so the answer lands in the reply instead of the reasoning.  Nothing before that point changes; it never shortens the reasoning, and a reply cut by `max_tokens` is left as it is.  When it fires the model usually writes its answer again after the reasoning (leave room in `max_tokens`), and the log prints `emitting the end tag`.  Needs a template whose reasoning end tag ends with one token (Qwen's `</think>`); otherwise the log says it is off. |
 
 Decode and draft verification are not affected: their batches are below every minimum above.
 
@@ -75,6 +76,7 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 | `GGML_LF_DRAFT_UB` | 0001 K1 | 數字，例如 `512` | 限制草稿模型的 ubatch（只會調小）。`-ub 2048` 時設 `512` 約省 0.7 GiB 顯存。 |
 | `GGML_LF_FA_FP8` | 0002 F8 | `1` | prefill 的 flash attention 改用 fp8。只在 `-fa on` 且 KV 快取為 q8_0（`-ctk q8_0 -ctv q8_0`）時作用，批次 32 token 以上、KV 512 格以上。 |
 | `GGML_LF_MXFP4_DIRECT` | 0003 M4 | `blaslt` | 只對 MXFP4 權重：prefill 時把權重精確轉成 fp8，用 0001 的 fp8 矩陣乘（不必另設 `GGML_LF_KQ_BLAS`）。批次 64 token 以上。（`fp8`、`f16` 是較舊的 kernel，稍慢。） |
+| `LLAMA_REASONING_GUARD` | 0004 | `1` | 模型在思考區裡抽到「結束回合」時，改成輸出思考區的結束標籤（`</think>`）並繼續生成，答案就會落在正文而不是思考區。在那之前的內容完全不變；不會縮短思考，被 `max_tokens` 截斷的回覆也照舊。觸發時模型通常會在思考之後把答案再寫一次（`max_tokens` 要留餘裕），log 會印 `emitting the end tag`。需要模板的思考結束標籤以單一 token 結尾（Qwen 的 `</think>`），否則 log 會說它沒開。 |
 
 decode 與草稿驗證不受影響：它們的批次都低於上面的下限。
 
