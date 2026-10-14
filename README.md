@@ -67,7 +67,7 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 | original | `v16-097cf33d9-r50` | 1124 | 50.8 | 1344 | 60.8 |
 | [2026&#8209;10&#8209;13](reports/2026-10-13.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1959** | 50.6 | **2397** | **66.2** |
 | original | `v12-097cf33d9-r59` | 1125 | 51.1 | 1335 | 60.0 |
-| 2026&#8209;10&#8209;15 | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2 | **2197** | 50.4 | **2365** | **66.2** |
+| [2026&#8209;10&#8209;15](reports/2026-10-15.md) | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2 | **2197** | 50.4 | **2365** | **66.2** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
