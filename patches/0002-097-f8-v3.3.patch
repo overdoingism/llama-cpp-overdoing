@@ -46,10 +46,10 @@ index 4d2e71803..27f1bd969 100644
              GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cu b/ggml/src/ggml-cuda/lf-fa-fp8.cu
 new file mode 100644
-index 000000000..7c85cc168
+index 000000000..3a6e21dc8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-fa-fp8.cu
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,611 @@
 +#include "lf-fa-fp8.cuh"
 +
 +#include <algorithm>
@@ -580,13 +580,16 @@ index 000000000..7c85cc168
 +    int2         * trange = (int2 *)        carve(sizes[10]);
 +    int2         * vrange = (int2 *)        carve(sizes[11]);
 +
-+    // the cells this batch sees (for the amax passes): derived mask -> range of positions; f16 mask -> last query's row
++    // the cells this batch sees (for the amax passes): derived mask (one sequence) -> range of positions; f16 mask -> every
++    // cell.  The f16 mask is also the form of a ubatch with several sequences, where the last query's row is one sequence's
++    // view only: the other sequences' cells were converted as zeros.  Every cell (all of them finite) keeps each query's own
++    // cells; its own mask row still decides what it attends to.
 +    const int   * cell_pos = derived ? (const int *) dst->src[5]->data : nullptr;
 +    const int   * tok_lo   = derived ? (const int *) dst->src[6]->data : nullptr;
 +    const int   * tok_hi   = derived ? (const int *) dst->src[7]->data : nullptr;
 +    const char  * mdata    = !derived && mask ? (const char *) mask->data : nullptr;
 +    const int64_t nb31     = !derived && mask ? mask->nb[1] : 0;
-+    const half  * mlast    = mdata ? (const half *) (mdata + (size_t) (n_q - 1) * nb31) : nullptr;
++    const half  * mlast    = nullptr;
 +    if (derived) lf_fa_vis_range<<<1, 256, 0, stream>>>(tok_lo, tok_hi, n_q, vrange);
 +
 +    CUDA_CHECK(cudaMemsetAsync(kbits, 0, (size_t) HKV * (D / 32) * sizeof(unsigned int), stream));

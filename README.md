@@ -12,8 +12,10 @@ files are the same patches for the previous base (`v16-a55e952b8-rN`).
 | patch | what | turn on | type | needs |
 |---|---|---|---|---|
 | `0001-097-k1-v3` | prefill matmuls of K-quant weights through hipBLASLt (f16, or fp8; fp8 corrects the largest activation channels) | `GGML_LF_KQ_BLAS=f16` (or `fp8`); `GGML_LF_DRAFT_UB=512` shrinks the draft model's ubatch | lossy | hipBLASLt |
-| `0002-097-f8-v3.2` | prefill flash attention in fp8 (and no growing F16 staging copy) | `GGML_LF_FA_FP8=1` | lossy | — |
+| `0002-097-f8-v3.3` | prefill flash attention in fp8 (and no growing F16 staging copy) | `GGML_LF_FA_FP8=1` | lossy | — |
 | `0003-097-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | lossy | 0001 |
+
+**2026-10-14:** `0002` F8 v3.3 fixes prompts prefilled together in one batch (`--parallel` ≥ 2): v3.1 and v3.2 zeroed the other sequences' attention in the F8 layers.  One sequence gives the same output as v3.2.  The `a55` file still has the bug: use `--parallel 1` with it.
 
 All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt, on
 `v16-a55e952b8-r8` (the patch code is the same on r50; speeds on r50 are in History, the quality check on r50 is in its report):
@@ -37,7 +39,8 @@ Every switch, its values, and the server parameters it needs: [SWITCHES.md](SWIT
 ## Applicable versions
 
 - **`097` files, tested:** rdna-boosts `v16-097cf33d9-r50`.  They apply in number order on the plain release, build, and give the
-  History numbers.  Other `v16-097cf33d9-rN` releases share the base and should work: check with `git apply --check` first.
+  History numbers.  Use that release: r51 and later (tagged `v12-097cf33d9-rN`) reorganized the sources, and `0001` does not
+  apply there; they are not supported yet.
 - **`a55` files:** `v16-a55e952b8-r8` tested (the Patches table and the first History rows; that build also had bit-identical
   patches since sent to rdna-boosts).  On r45 and later, `0001` has one conflicting hunk in
   `ggml/src/ggml-cuda/ggml-cuda.cu` (start of graph compute: keep both rdna-boosts' `bf16_src1_cache_clear()` line and K1's
