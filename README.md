@@ -43,16 +43,9 @@ Every switch, its values, and the server parameters it needs: [SWITCHES.md](SWIT
 
 ## Applicable versions
 
-- **`patches/0*-097-*`, tested:** rdna-boosts `v12-097cf33d9-r59`.  They apply in number order on the plain release, build, and
-  give the History numbers; they also apply on r56.  Other releases from r51 on share the source layout: check with
-  `git apply --check` first.
-- **`patches/r50/`:** for `v16-097cf33d9-r50` (r51 reorganized the sources; the top-level `0001` and `0003` do not apply to r50).
-  K1 v3 there.  The top-level `0004` applies to r50 as well (it only changes `common/sampling.cpp`).
-- **`patches/a55/`:** `v16-a55e952b8-r8` tested (the Patches table and the first History rows; that build also had bit-identical
-  patches since sent to rdna-boosts).  On r45 and later, `0001` has one conflicting hunk in
-  `ggml/src/ggml-cuda/ggml-cuda.cu` (start of graph compute: keep both rdna-boosts' `bf16_src1_cache_clear()` line and K1's
-  `graph_begin` line).
-- A new upstream base (a different `v16-<hash>`) needs a new patch set.
+Tested on rdna-boosts `v12-097cf33d9-r59`: the patches in `patches/` apply in number order on the plain release, build, and give
+the History numbers.  On another release, check with `git apply --check` first.  A release on a new upstream base (not
+`097cf33d9`) needs a new patch set.
 
 ## History
 
