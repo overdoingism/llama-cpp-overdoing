@@ -14,8 +14,10 @@ command in bash, `$env:NAME = "value"` in PowerShell); to turn one off, unset it
 | `GGML_LF_FA_FP8` | 0002 F8 | `1` | Prefill flash attention in fp8.  Runs only with `-fa on` and a q8_0 KV cache (`-ctk q8_0 -ctv q8_0`), on batches of 32 tokens or more over 512 or more KV cells. |
 | `GGML_LF_MXFP4_DIRECT` | 0003 M4 | `blaslt` | MXFP4 weights only: prefill converts them exactly to fp8 and runs 0001's fp8 GEMM (`GGML_LF_KQ_BLAS` does not have to be set).  Batches of 64 tokens or more.  (`fp8` and `f16` select older kernels, a little slower.) |
 | `LLAMA_REASONING_GUARD` | 0004 | `1` | When the model samples an end of turn inside its reasoning block, the block's end tag (`</think>`) is emitted instead and generation goes on, so the answer lands in the reply instead of the reasoning.  Nothing before that point changes; it never shortens the reasoning, and a reply cut by `max_tokens` is left as it is.  When it fires the model usually writes its answer again after the reasoning (leave room in `max_tokens`), and the log prints `emitting the end tag`.  Needs a template whose reasoning end tag ends with one token (Qwen's `</think>`); otherwise the log says it is off. |
+| `GGML_CUDA_MMVK` | 0006 mmvk | `1`-`4` | Q4_K / Q5_K / Q6_K matmuls of 1 to 8 tokens (decode and speculative verification) run a kernel that keeps the activations in registers across several weight rows.  `2`: also launches the matmuls that read the same input (gate + up, q + k + v, DeltaNet qkv + z) as one kernel (recommended); `1`: one launch each (same numbers, about 1% slower).  `1` and `2` are on only when llama-server verifies speculative drafts (a draft model, MTP or an n-gram type): one-token decode alone is 1-1.6% faster on the stock kernel.  `3` / `4` are the same, always (also for programs other than llama-server).  The server log prints `mmvk on (...)` or `mmvk off (...)`.  Not bit-identical to the stock kernel (float summation order); decode and verification give the same results as each other. |
+| `GGML_CUDA_MMVK_EXT` | 0006 mmvk | bit mask, default `1` | `1`: groups may mix weight types.  `2`: IQ4_XS / IQ4_NL / MXFP4 through mmvk too (their stock kernel is already close to the bandwidth limit; normally leave unset). |
 
-Decode and draft verification are not affected: their batches are below every minimum above.
+0001-0003 do not touch decode and draft verification: their batches are below every minimum above.  0006 is only for them.
 
 ## Server parameters they need
 
@@ -32,6 +34,7 @@ GGML_LF_FA_FP8=1
 GGML_LF_MXFP4_DIRECT=blaslt
 GGML_LF_DRAFT_UB=512
 GGML_LF_DFLASH_DEV=1
+GGML_CUDA_MMVK=2
 llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 ```
 
@@ -77,8 +80,10 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 | `GGML_LF_FA_FP8` | 0002 F8 | `1` | prefill 的 flash attention 改用 fp8。只在 `-fa on` 且 KV 快取為 q8_0（`-ctk q8_0 -ctv q8_0`）時作用，批次 32 token 以上、KV 512 格以上。 |
 | `GGML_LF_MXFP4_DIRECT` | 0003 M4 | `blaslt` | 只對 MXFP4 權重：prefill 時把權重精確轉成 fp8，用 0001 的 fp8 矩陣乘（不必另設 `GGML_LF_KQ_BLAS`）。批次 64 token 以上。（`fp8`、`f16` 是較舊的 kernel，稍慢。） |
 | `LLAMA_REASONING_GUARD` | 0004 | `1` | 模型在思考區裡抽到「結束回合」時，改成輸出思考區的結束標籤（`</think>`）並繼續生成，答案就會落在正文而不是思考區。在那之前的內容完全不變；不會縮短思考，被 `max_tokens` 截斷的回覆也照舊。觸發時模型通常會在思考之後把答案再寫一次（`max_tokens` 要留餘裕），log 會印 `emitting the end tag`。需要模板的思考結束標籤以單一 token 結尾（Qwen 的 `</think>`），否則 log 會說它沒開。 |
+| `GGML_CUDA_MMVK` | 0006 mmvk | `1`～`4` | Q4_K／Q5_K／Q6_K 在 1～8 個 token 時的矩陣乘（decode 與推測解碼的驗證）改用 mmvk：activation 留在暫存器裡，給多列權重重複使用。`2`：讀同一個輸入的矩陣乘（gate＋up、q＋k＋v、DeltaNet qkv＋z）合併成一次發射（建議）；`1`：各自發射（數值相同，約慢 1%）。`1`、`2` 只在 llama-server 驗證推測解碼草稿時開（草稿模型、MTP 或 ngram）：只有單 token decode 時原版 kernel 快 1～1.6%。`3`／`4` 相同但一律開（llama-server 以外的程式也適用）。server log 會印 `mmvk on (...)` 或 `mmvk off (...)`。和原版 kernel 不逐位元相同（浮點加總順序不同）；decode 與驗證彼此一致。 |
+| `GGML_CUDA_MMVK_EXT` | 0006 mmvk | 位元，預設 `1` | `1`：合併發射可混合不同權重型別。`2`：IQ4_XS／IQ4_NL／MXFP4 也走 mmvk（這些型別的原版 kernel 已接近頻寬上限，平常不設）。 |
 
-decode 與草稿驗證不受影響：它們的批次都低於上面的下限。
+0001～0003 不影響 decode 與草稿驗證：它們的批次都低於上面的下限。0006 只作用在這兩者。
 
 ## 需要配合的 server 參數
 
@@ -89,7 +94,7 @@ decode 與草稿驗證不受影響：它們的批次都低於上面的下限。
 
 ## 全開（基準測試用的設定）
 
-見上方英文段的區塊：`GGML_LF_KQ_BLAS=fp8`、`GGML_LF_FA_FP8=1`、`GGML_LF_MXFP4_DIRECT=blaslt`、`GGML_LF_DRAFT_UB=512`、`GGML_LF_DFLASH_DEV=1`，加上 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0`。
+見上方英文段的區塊：`GGML_LF_KQ_BLAS=fp8`、`GGML_LF_FA_FP8=1`、`GGML_LF_MXFP4_DIRECT=blaslt`、`GGML_LF_DRAFT_UB=512`、`GGML_LF_DFLASH_DEV=1`、`GGML_CUDA_MMVK=2`，加上 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0`。
 
 ## 演算法選擇（平常不設）
 

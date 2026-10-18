@@ -1,8 +1,9 @@
 # llama-cpp-overdoing
 
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
-for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, an opt-in guard against replies that end
-inside the reasoning, and fixes of upstream llama.cpp code that we keep here.  Other bit-identical work goes to rdna-boosts itself.
+for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, a faster decode / draft-verification
+matmul, an opt-in guard against replies that end inside the reasoning, and fixes of upstream llama.cpp code that we keep here.
+Other bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
 ## Patches
@@ -18,6 +19,9 @@ the previous base (`v16-a55e952b8-rN`).
 | `0003-097-m4-v2` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM | `GGML_LF_MXFP4_DIRECT=blaslt` | speed/lossy | 0001 |
 | `0004-097-reasoning-guard-v1` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts) | `LLAMA_REASONING_GUARD=1` | guard | — |
 | `0005-097-backend-sampling-reserve-v1` | with `--backend-sampling`, the compute buffers are reserved once per sequence instead of being freed and allocated again for every request (upstream llama.cpp behavior; about 0.25 s per request on a 27B model at `-ub 2048`) | always on | fix | — |
+| `0006-097-mmvk-v2` | Q4_K / Q5_K / Q6_K matmuls of 1 to 8 tokens (decode and speculative verification) keep the activations in registers across several weight rows, and the matmuls that read the same input go out as one launch; not bit-identical to the stock kernel (float summation order), KLD below the run-to-run floor.  On only when llama-server verifies drafts (draft model, MTP or n-gram): one-token decode alone is faster on the stock kernel | `GGML_CUDA_MMVK=2` (`4`: also without drafts) | speed | 0001, 0003 (context) |
+
+**2026-10-18:** new `0006` (mmvk), for decode with speculative drafts: Qwen3.8-27B K-quant models take 4.5-6% less time per step (standard benchmark Q5 decode +6%), draft acceptance unchanged, KLD below the floor.  Off unless `GGML_CUDA_MMVK` is set; `2` turns it on only when llama-server verifies drafts.  See the [report](reports/2026-10-18.md).
 
 **2026-10-15 (later):** new `0005`, a fix for `--backend-sampling`: llama.cpp re-reserved the compute graph on every request, freeing and allocating all compute buffers again.  Same output; see the [report](reports/2026-10-15.md#backend-sampling-fix-0005).
 
@@ -36,7 +40,7 @@ All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B U
 | F8 | +3% / +17% | 0.0020 / 0.0007 |
 | M4 (MXFP4 models only) | +55% at 8K, +44% at 110K | +≈0.001 over the MXFP4 weights themselves |
 
-Decode is unchanged.  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
+Decode is unchanged by these three (`0006` is the decode one).  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
 2-3% for Chinese text and 0.1-0.3% for English; generation reads the prompt through the KV cache and sees far less (the KLD column).
 For prompt-scoring workloads use `f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
 
@@ -64,6 +68,7 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 | [2026&#8209;10&#8209;13](reports/2026-10-13.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1959** | 50.6 | **2397** | **66.2** |
 | original | `v12-097cf33d9-r59` | 1125 | 51.1 | 1335 | 60.0 |
 | [2026&#8209;10&#8209;15](reports/2026-10-15.md) | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2 | **2197** | 50.4 | **2365** | **66.2** |
+| [2026&#8209;10&#8209;18](reports/2026-10-18.md) | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2, mmvk&nbsp;v2 | **2207** | **53.8** | **2389** | **67.2** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 

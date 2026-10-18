@@ -14,7 +14,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS=gfx12
 cmake --build build --target llama-server -j
 ```
 
-- Apply in number order (0003 needs 0001; 0004 and 0005 stand alone).  The patches add `.cu` files: after applying, always run the configure step again.
+- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0004 and 0005 stand alone).  The patches add `.cu` files: after applying, always run the configure step again.
 - For r50, use the files in `patches/r50/` (plus the top-level `0004` if wanted).  For a `v16-a55e952b8-rN` release, check out
   `a55e952b8` and use `patches/a55/`.
 - The configure step may log `UI: download dist.tar.gz... failed` (it tries to fetch the web UI); harmless, the build
@@ -35,7 +35,7 @@ cmake --build build --target llama-server -j
 
 1. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `097cf33d9`。
 2. clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v12-097cf33d9-r59`（r51 以後皆可；r50 改用 `patches/r50/`；舊基底 `v16-a55e952b8-rN` 要 checkout `a55e952b8`，改用 `patches/a55/`），在 llama.cpp 目錄裡執行它的 `scripts/apply-all.sh .`。
-3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0004、0005 可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
+3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0004、0005 可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
 4. cmake：`-DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON`，`GGML_HIP_LF_HIPBLASLT` 保持預設 ON；其他參數照 rdna-boosts README（多卡才需要 `-DGGML_HIP_RCCL=1`）。找不到 HIP 編譯器時加 `-DCMAKE_HIP_COMPILER=<rocm>/lib/llvm/bin/clang++`。
 5. hipBLASLt 會從 `libhipblaslt.so` 旁邊的 `hipblaslt/library` 載入 kernel（TheRock 在 `hipblaslt/library/gfx1201/`），只要載入的是那個 ROCm `lib` 資料夾就不必複製（pip／TheRock 安裝要把它放進 `LD_LIBRARY_PATH`）。log 出現 `GGML_LF_KQ_BLAS: hipBLASLt has no f16 kernels ...` 時，把 `HIPBLASLT_TENSILE_LIBPATH` 設成那個 `gfx1201` 資料夾。
 6. 編 `llama-server`。執行時設環境變數（所有開關見 [SWITCHES.md](SWITCHES.md)），log 要出現 `GGML_LF_KQ_BLAS: f16 prefill GEMM through hipBLASLt on`。
