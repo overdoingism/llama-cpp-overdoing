@@ -69,6 +69,27 @@ index 83b9d8858..6bee585ad 100644
      result.cache_type_k  = params_spec.cache_type_k;
      result.cache_type_v  = params_spec.cache_type_v;
      result.n_outputs_max = params.n_parallel;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 3cd2fd7f5..19a6f39b7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -8,6 +8,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
++#include "ggml-cuda/lf-kq-blas.cuh"   // Llama-Frankenstein K1
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+ #include "ggml-cuda/arange.cuh"
+@@ -1152,6 +1153,8 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     if (ggml_cuda_cache_blocks_fusion(cuda_ctx, cgraph, i)) {
+         return 0;
+     }
++    // K1 fp8: remember whether this node produces a K1 matmul's activation (its launcher then folds the channel amax in)
++    ggml_cuda_lf_kq8_amax_mark(*cuda_ctx, cgraph, i);
+ 
+     // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
+     static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 803bf8663..f29e362eb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -133,10 +154,10 @@ index 803bf8663..f29e362eb 100644
  
 diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cu b/ggml/src/ggml-cuda/lf-kq-blas.cu
 new file mode 100644
-index 000000000..539b349bd
+index 000000000..f6784b883
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-kq-blas.cu
-@@ -0,0 +1,1479 @@
+@@ -0,0 +1,1624 @@
 +#include "lf-kq-blas.cuh"
 +#include "convert.cuh"
 +#include "dequantize.cuh"
@@ -923,12 +944,53 @@ index 000000000..539b349bd
 +    for (int j = threadIdx.x; j < k; j += blockDim.x) cand[(size_t) blockIdx.x * k + j] = j < P ? key[j] : 0ull;
 +}
 +
-+__global__ void lf_kq8_topk_merge(const unsigned long long * __restrict__ cand, const int n, const int P, const int k,
++__global__ void lf_kq8_topk_merge_sort(const unsigned long long * __restrict__ cand, const int n, const int P, const int k,
 +        int * __restrict__ idx, uint8_t * __restrict__ pos, unsigned int * __restrict__ gbits) {
 +    extern __shared__ unsigned long long key[];
 +    for (int i = threadIdx.x; i < P; i += blockDim.x) key[i] = i < n ? cand[i] : 0ull;
 +    __syncthreads();
 +    lf_kq8_bitonic_desc(key, P);
++    for (int j = threadIdx.x; j < k; j += blockDim.x) {
++        const int c = (int) (0xffffffffu - (unsigned int) (key[j] & 0xffffffffu));
++        idx[j] = c;
++        pos[c] = (uint8_t) (j + 1);
++    }
++    if (threadIdx.x == 0) *gbits = (unsigned int) (key[0] >> 32);
++}
++
++// stage 2: each of the G lists holds its segment's top k, sorted (descending; distinct keys: the channel is in the low bits).
++// Pairs of lists merge into their top Pk (Pk = k rounded up to a power of two, zero padded): z[i] = max(x[i], y[Pk - 1 - i])
++// keeps the top Pk of both as a bitonic sequence, which log2(Pk) half-cleaner steps sort; log2(G) such levels leave the top k
++// of all G * k candidates in order -- the same channels, order and batch amax as sorting all of them.
++__global__ void lf_kq8_topk_merge(const unsigned long long * __restrict__ cand, const int G, const int k, const int Gp, const int Pk,
++        int * __restrict__ idx, uint8_t * __restrict__ pos, unsigned int * __restrict__ gbits) {
++    extern __shared__ unsigned long long key[];   // Gp lists of Pk
++    for (int i = threadIdx.x; i < Gp * Pk; i += blockDim.x) {
++        const int l = i / Pk, j = i - l * Pk;
++        key[i] = l < G && j < k ? cand[(size_t) l * k + j] : 0ull;
++    }
++    __syncthreads();
++    for (int s = 1; s < Gp; s <<= 1) {            // merge list l (l % 2s == 0) with list l + s, into list l
++        const int nm = Gp / (2 * s);              // merges at this level
++        for (int t = threadIdx.x; t < nm * Pk; t += blockDim.x) {
++            const int m = t / Pk, i = t - m * Pk;
++            unsigned long long * x = key + (size_t) (2 * s * m) * Pk;
++            const unsigned long long * y = x + (size_t) s * Pk;
++            const unsigned long long b = y[Pk - 1 - i];
++            if (b > x[i]) x[i] = b;
++        }
++        __syncthreads();
++        for (int st = Pk / 2; st > 0; st >>= 1) {
++            for (int t = threadIdx.x; t < nm * (Pk / 2); t += blockDim.x) {
++                const int m = t / (Pk / 2), i = t - m * (Pk / 2);
++                unsigned long long * x = key + (size_t) (2 * s * m) * Pk;
++                const int lo = 2 * i - (i & (st - 1)), hi = lo + st;
++                const unsigned long long a = x[lo], b = x[hi];
++                if (a < b) { x[lo] = b; x[hi] = a; }
++            }
++            __syncthreads();
++        }
++    }
 +    for (int j = threadIdx.x; j < k; j += blockDim.x) {
 +        const int c = (int) (0xffffffffu - (unsigned int) (key[j] & 0xffffffffu));
 +        idx[j] = c;
@@ -1006,8 +1068,42 @@ index 000000000..539b349bd
 +    char * ptr = nullptr; size_t size = 0;
 +    const void * x_src = nullptr; const void * x_data = nullptr;
 +    int T = 0, K = 0, k = 0; uint64_t gen = 0;
++    // the channel amax filled by the producer of this input (ggml_cuda_lf_kq8_amax_take), valid until the buffer is reused
++    const void * pre_src = nullptr; const void * pre_data = nullptr;
++    int pre_T = 0, pre_K = 0, pre_k = 0; uint64_t pre_gen = 0;
 +};
 +std::map<cudaStream_t, lf_kq8_act> g_lf_kq8_acts;   // under lf_blt().mutex
++
++// the buffer of one input: [ xq T x Kp | sx | batch amax | kept channels k | channel amax K | channel -> slot K | top-k candidates ]
++struct lf_kq8_act_layout {
++    size_t o_sx, o_g, o_idx, o_cb, o_ps, o_cd, need;
++    int G, seg;
++    lf_kq8_act_layout(const int T, const int K, const int kk) {
++        const int Kp = K + 2 * kk;
++        o_sx  = ((size_t) T * Kp + 255) / 256 * 256;
++        o_g   = o_sx + 64; o_idx = o_g + 64; o_cb = o_idx + ((size_t) kk * 4 + 255) / 256 * 256;
++        G     = std::max(1, std::min(64, 4096 / kk));               // stage-1 blocks: G * k candidates <= 4096
++        seg   = (K + G - 1) / G;
++        o_ps  = o_cb + ((size_t) K * 4 + 255) / 256 * 256;
++        o_cd  = o_ps + ((size_t) K + 255) / 256 * 256;
++        need  = o_cd + (size_t) G * kk * 8;
++    }
++};
++void lf_kq8_act_reserve(lf_kq8_act & ac, const size_t need, cudaStream_t stream) {
++    if (ac.size >= need) return;
++    if (ac.ptr) {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        CUDA_CHECK(cudaFree(ac.ptr));
++    }
++    CUDA_CHECK(cudaMalloc((void **) &ac.ptr, need));
++    ac.size    = need;
++    ac.x_src   = nullptr;
++    ac.pre_src = nullptr;
++}
++
++// producer -> K1 matmul pairs found by ggml_cuda_lf_kq8_amax_mark, one per stream (under lf_blt().mutex)
++struct lf_kq8_amax_pair { const ggml_tensor * prod = nullptr; const ggml_tensor * mm = nullptr; uint64_t gen = 0; };
++std::map<cudaStream_t, lf_kq8_amax_pair> g_lf_kq8_amax_marks;
 +
 +// The weights straight from their quant blocks to fp8: each 256-value super-block is dequantized into LDS by ggml's own device
 +// function (the same half values to_fp16 writes), then converted exactly as lf_kq_f16_to_fp8 / lf_kq8_f16_to_fp8_keep do, so the
@@ -1216,39 +1312,38 @@ index 000000000..539b349bd
 +
 +    // activations: once per input and graph
 +    lf_kq8_act & ac = g_lf_kq8_acts[stream];
-+    const size_t o_sx = ((size_t) T * Kp + 255) / 256 * 256;
-+    const size_t o_g  = o_sx + 64, o_idx = o_g + 64, o_cb = o_idx + ((size_t) kk * 4 + 255) / 256 * 256;
-+    const int    G    = std::max(1, std::min(64, 4096 / kk));               // stage-1 blocks: G * k candidates <= 4096
-+    const int    seg  = (K + G - 1) / G;
-+    const size_t o_ps = o_cb + ((size_t) K * 4 + 255) / 256 * 256;
-+    const size_t o_cd = o_ps + ((size_t) K + 255) / 256 * 256, need = o_cd + (size_t) G * kk * 8;
-+    if (ac.size < need) {
-+        if (ac.ptr) {
-+            CUDA_CHECK(cudaStreamSynchronize(stream));
-+            CUDA_CHECK(cudaFree(ac.ptr));
-+        }
-+        CUDA_CHECK(cudaMalloc((void **) &ac.ptr, need));
-+        ac.size  = need;
-+        ac.x_src = nullptr;
-+    }
++    const lf_kq8_act_layout L(T, K, kk);
++    const int G = L.G, seg = L.seg;
++    lf_kq8_act_reserve(ac, L.need, stream);
 +    uint8_t      * xq  = (uint8_t *) ac.ptr;
-+    float        * sx  = (float *) (ac.ptr + o_sx);
-+    unsigned int * gb  = (unsigned int *) (ac.ptr + o_g);
-+    int          * idx = (int *) (ac.ptr + o_idx);
-+    unsigned int * cb  = (unsigned int *) (ac.ptr + o_cb);
-+    uint8_t      * pos = (uint8_t *) (ac.ptr + o_ps);
-+    unsigned long long * cand = (unsigned long long *) (ac.ptr + o_cd);
++    float        * sx  = (float *) (ac.ptr + L.o_sx);
++    unsigned int * gb  = (unsigned int *) (ac.ptr + L.o_g);
++    int          * idx = (int *) (ac.ptr + L.o_idx);
++    unsigned int * cb  = (unsigned int *) (ac.ptr + L.o_cb);
++    uint8_t      * pos = (uint8_t *) (ac.ptr + L.o_ps);
++    unsigned long long * cand = (unsigned long long *) (ac.ptr + L.o_cd);
 +    static const bool share = !getenv("GGML_LF_KQ_BLAS_SHARE") || atoi(getenv("GGML_LF_KQ_BLAS_SHARE")) != 0;
 +    const ggml_tensor * x_src = src1;
 +    while (x_src->view_src != nullptr) x_src = x_src->view_src;
 +    const uint64_t gen = g_lf_fp8_graph_gen.load(std::memory_order_relaxed);
 +    if (!share || ac.x_src != x_src || ac.x_data != x || ac.T != T || ac.K != K || ac.k != kk || ac.gen != gen) {
-+        CUDA_CHECK(cudaMemsetAsync(cb, 0, (size_t) K * 4, stream));
-+        lf_kq8_chan_amax<<<dim3((K + 255) / 256, (T + 63) / 64), 256, 0, stream>>>(x, T, K, cb);
++        // the producer of this input may have filled the channel amax already (ggml_cuda_lf_kq8_amax_take); a maximum does
++        // not depend on the order, so either way gives the same bits
++        const bool pre = ac.pre_src == x_src && ac.pre_data == x && ac.pre_T == T && ac.pre_K == K && ac.pre_k == kk && ac.pre_gen == gen;
++        if (!pre) {
++            CUDA_CHECK(cudaMemsetAsync(cb, 0, (size_t) K * 4, stream));
++            lf_kq8_chan_amax<<<dim3((K + 255) / 256, (T + 63) / 64), 256, 0, stream>>>(x, T, K, cb);
++            ac.pre_src = nullptr;
++        }
 +        const int P1 = lf_kq8_pow2(std::max(seg, kk)), P2 = lf_kq8_pow2(G * kk);
 +        GGML_ASSERT(P1 <= 4096 && P2 <= 4096);
 +        lf_kq8_topk_part<<<G, 256, (size_t) P1 * 8, stream>>>(cb, K, seg, P1, kk, cand, pos);
-+        lf_kq8_topk_merge<<<1, 1024, (size_t) P2 * 8, stream>>>(cand, G * kk, P2, kk, idx, pos, gb);
++        const int Gp = lf_kq8_pow2(G), Pk = lf_kq8_pow2(kk);
++        if (Gp * Pk <= 4096) {
++            lf_kq8_topk_merge<<<1, 1024, (size_t) Gp * Pk * 8, stream>>>(cand, G, kk, Gp, Pk, idx, pos, gb);
++        } else {   // a KEEP whose padded lists do not fit the 32 KiB of keys: sort all G * k candidates
++            lf_kq8_topk_merge_sort<<<1, 1024, (size_t) P2 * 8, stream>>>(cand, G * kk, P2, kk, idx, pos, gb);
++        }
 +        lf_kq8_quant_act_keep<<<T, 256, 0, stream>>>(x, xq, gb, sx, idx, kk, K, Kp);
 +        ac.x_src = x_src; ac.x_data = x; ac.T = T; ac.K = K; ac.k = kk; ac.gen = gen;
 +    }
@@ -1286,6 +1381,77 @@ index 000000000..539b349bd
 +#else
 +    GGML_UNUSED_VARS(ctx, src0, src1, dst, kk);
 +    GGML_ABORT("GGML_LF_KQ_BLAS=fp8 needs hipBLASLt");
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++// K1 fp8 KEEP: the channel amax of a matmul's activation, folded into the kernel that produces it (see lf-kq-blas.cuh)
++void ggml_cuda_lf_kq8_amax_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
++#if defined(GGML_LF_HIPBLASLT)
++    const ggml_tensor * node = cgraph->nodes[i];
++    if ((node->op != GGML_OP_GLU && node->op != GGML_OP_UNARY) || lf_kq_mode() != 2) return;
++    const ggml_tensor * prod = nullptr;
++    if (node->op == GGML_OP_GLU) {
++        prod = node;
++    } else if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
++               (cgraph->nodes[i + 1]->src[0] == node || cgraph->nodes[i + 1]->src[1] == node)) {
++        prod = cgraph->nodes[i + 1];
++    }
++    if (prod == nullptr || prod->type != GGML_TYPE_F32 || !ggml_is_contiguous(prod) || ggml_nrows(prod) < lf_kq_min_t()) return;
++    auto root = [](const ggml_tensor * t) { while (t->view_src != nullptr) t = t->view_src; return t; };
++    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8); ++j) {
++        const ggml_tensor * mm = cgraph->nodes[j];
++        if (mm->op != GGML_OP_MUL_MAT) continue;
++        const ggml_tensor * s1 = mm->src[1];
++        // the matmul reads the producer's output in its own row length (a whole number of the producer's rows: the GDN gate's
++        // 128-value head rows are one 6144-value row of the output projection)
++        if (root(s1) != root(prod) || s1->data != prod->data || !ggml_is_contiguous(s1) || ggml_nelements(s1) != ggml_nelements(prod) ||
++            s1->ne[0] % prod->ne[0] != 0) continue;
++        if (!ggml_cuda_lf_kq_blas_will_take(mm) || lf_kq_fp8_keep_for((int) mm->src[0]->ne[0]) == 0) return;
++        lf_blt_state & st = lf_blt();
++        std::lock_guard<std::mutex> lock(st.mutex);
++        g_lf_kq8_amax_marks[ctx.stream()] = { prod, mm, g_lf_fp8_graph_gen.load(std::memory_order_relaxed) };
++        return;
++    }
++#else
++    GGML_UNUSED_VARS(ctx, cgraph, i);
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
++unsigned int * ggml_cuda_lf_kq8_amax_take(ggml_backend_cuda_context & ctx, const ggml_tensor * producer, int64_t * row_len) {
++#if defined(GGML_LF_HIPBLASLT)
++    if (lf_kq_mode() != 2) return nullptr;
++    cudaStream_t stream = ctx.stream();
++    const ggml_tensor * mm = nullptr;
++    {
++        lf_blt_state & st = lf_blt();
++        std::lock_guard<std::mutex> lock(st.mutex);
++        auto it = g_lf_kq8_amax_marks.find(stream);
++        if (it == g_lf_kq8_amax_marks.end()) return nullptr;
++        const lf_kq8_amax_pair m = it->second;
++        g_lf_kq8_amax_marks.erase(it);
++        if (m.prod != producer || m.gen != g_lf_fp8_graph_gen.load(std::memory_order_relaxed)) return nullptr;
++        mm = m.mm;
++    }
++    const ggml_tensor * src0 = mm->src[0], * src1 = mm->src[1];
++    const int kk = lf_kq_fp8_keep_for((int) src0->ne[0]);
++    if (kk == 0 || !ggml_cuda_lf_kq_blas_supported(ctx, src0, src1, mm)) return nullptr;
++    const int K = (int) src0->ne[0], T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    const ggml_tensor * x_src = src1;
++    while (x_src->view_src != nullptr) x_src = x_src->view_src;
++    lf_blt_state & st = lf_blt();
++    std::lock_guard<std::mutex> lock(st.mutex);
++    lf_kq8_act & ac = g_lf_kq8_acts[stream];
++    const lf_kq8_act_layout L(T, K, kk);
++    lf_kq8_act_reserve(ac, L.need, stream);
++    unsigned int * cb = (unsigned int *) (ac.ptr + L.o_cb);
++    CUDA_CHECK(cudaMemsetAsync(cb, 0, (size_t) K * 4, stream));
++    *row_len = K;
++    ac.pre_src = x_src; ac.pre_data = src1->data; ac.pre_T = T; ac.pre_K = K; ac.pre_k = kk;
++    ac.pre_gen = g_lf_fp8_graph_gen.load(std::memory_order_relaxed);
++    return cb;
++#else
++    GGML_UNUSED_VARS(ctx, producer, row_len);
++    return nullptr;
 +#endif // defined(GGML_LF_HIPBLASLT)
 +}
 +
@@ -1618,10 +1784,10 @@ index 000000000..539b349bd
 +}
 diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cuh b/ggml/src/ggml-cuda/lf-kq-blas.cuh
 new file mode 100644
-index 000000000..0672fab91
+index 000000000..374f90f3f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-kq-blas.cuh
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,45 @@
 +#pragma once
 +#include "common.cuh"
 +// Llama-Frankenstein K1 (written by Claude): prefill GEMM of quantized weights as f16 through hipBLASLt (RDNA4).
@@ -1657,6 +1823,16 @@ index 000000000..0672fab91
 +bool ggml_cuda_lf_fp8_gemm_ready(int M, int T, int K);
 +void ggml_cuda_lf_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const float * av, const uint8_t * w8, float * y,
 +                           int M, int T, int K);
++
++// v3.3: the channel amax of the KEEP path folded into the kernel that writes the activation (a GLU, or a gated unary fused with
++// its MUL), instead of a pass of its own over the activation.  ggml_cuda_try_fuse calls ggml_cuda_lf_kq8_amax_mark for every
++// node: when node i (or node i + 1, the MUL of a UNARY + MUL pair) produces the activation of a matmul this path takes, the pair
++// is remembered for the stream.  The producer's launcher then asks ggml_cuda_lf_kq8_amax_take for the zeroed channel amax
++// buffer and the matmul's row length (a whole number of the producer's rows; nullptr: nothing to fold, run the plain kernel)
++// and folds atomicMax(|value| bits) per channel into it; the matmul skips its own amax pass.  A maximum does not depend on
++// the order: the same bits as without.
++void           ggml_cuda_lf_kq8_amax_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++unsigned int * ggml_cuda_lf_kq8_amax_take(ggml_backend_cuda_context & ctx, const ggml_tensor * producer, int64_t * row_len);
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
 index 831fea945..e8542ff9a 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
@@ -1691,6 +1867,84 @@ index 831fea945..e8542ff9a 100644
              ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
          ggml_cuda_mul_mat_q_swiglu_dense(ctx, next->src[0], next, node);
          return 1;
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 681a30487..1862c2724 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -1,4 +1,5 @@
+ #include "unary.cuh"
++#include "lf-kq-blas.cuh"   // Llama-Frankenstein K1
+ #include "convert.cuh"
+ #include "mmb.cuh"
+ 
+@@ -458,6 +459,37 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+     }
+ }
+ 
++// Same products as unary_gated_op_kernel (f32), each thread one channel c of the K1 fp8 matmul that reads them (rows of kc =
++// R whole rows of n) over 64 of its rows, also folding the channel's absolute maximum into that matmul's channel amax buffer
++// (ggml_cuda_lf_kq8_amax_take), which then skips that pass.  Every product and its address are those of the plain kernel.
++template <float (*op)(float)>
++static __global__ void unary_gated_chan_amax_kernel(const float * __restrict__ x, const float * __restrict__ g, float * __restrict__ dst,
++        const int64_t n, const int64_t kc, const int64_t nrows, const int64_t o0, const int64_t o1, unsigned int * __restrict__ cbits) {
++    const int64_t c = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++    if (c >= kc) {
++        return;
++    }
++    const int64_t hp = c / n, cp = c - hp*n, R = kc / n;   // the matmul's channel c = producer row t*R + hp, column cp
++    // 64 rows per block: one atomic per channel and 64 rows, as lf_kq8_chan_amax (16 rows, unrolled, was slower in place)
++    const int64_t r0 = int64_t(blockIdx.y)*64, r1 = r0 + 64 < nrows ? r0 + 64 : nrows;
++    const float * xp = x + hp*o0 + cp;
++    const float * gp = g + hp*o1 + cp;
++    float a = 0.0f;
++    for (int64_t t = r0; t < r1; ++t) {
++        const float v = op((float)ggml_cuda_nt_load(xp + t*R*o0)) * (float)ggml_cuda_nt_load(gp + t*R*o1);
++        dst[t*kc + c] = v;
++        a = fmaxf(a, fabsf(v));
++    }
++    atomicMax(cbits + c, __float_as_uint(a));
++}
++
++template <float (*op)(float)>
++static void unary_gated_chan_amax_cuda(const float * x, const float * g, float * dst, const int64_t n, const int64_t kc, const int64_t nrows,
++        const int64_t o0, const int64_t o1, unsigned int * cbits, cudaStream_t stream) {
++    const dim3 grid((unsigned) ((kc + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE), (unsigned) ((nrows + 63) / 64));
++    unary_gated_chan_amax_kernel<op><<<grid, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, n, kc, nrows, o0, o1, cbits);
++}
++
+ // Same as unary_gated_op_kernel but writes the Q8_1 quantized product into the
+ // per-graph quantize arena instead of the F32 output. Each warp covers 32
+ // consecutive flat elements (one Q8_1 block), matching quantize_row_q8_1_cuda
+@@ -662,6 +694,13 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             }
+         }
+ 
++        // K1 fp8: this GLU writes a K1 matmul's activation -- fold the channel amax in
++        int64_t kc = 0;
++        if (unsigned int * cbits = ggml_cuda_lf_kq8_amax_take(ctx, dst, &kc)) {
++            unary_gated_chan_amax_cuda<op>(src0_p, src1_p, (float *)dst_d, nc, kc, ggml_nelements(dst) / kc, src0_o / sizeof(float), src1_o / sizeof(float), cbits, stream);
++            return;
++        }
++
+         unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+     }
+ }
+@@ -1015,6 +1054,15 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+                              (nv_bfloat16 *) mul_node->data, k, nc,
+                              unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream, dst16, store_f32);
+     } else {
++        // K1 fp8: the product is a K1 matmul's activation -- fold the channel amax in (not with MMB's BF16 copy)
++        if (dst16 == nullptr && store_f32 && ggml_is_contiguous(mul_node)) {
++            int64_t kc = 0;
++            if (unsigned int * cbits = ggml_cuda_lf_kq8_amax_take(ctx, mul_node, &kc)) {
++                unary_gated_chan_amax_cuda<op>((const float *) unary_src->data, (const float *) other_src->data, (float *) mul_node->data,
++                                               nc, kc, k / kc, unary_stride / sizeof(float), other_stride / sizeof(float), cbits, stream);
++                return;
++            }
++        }
+         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
+                              (float *) mul_node->data, k, nc,
+                              unary_stride / sizeof(float), other_stride / sizeof(float), stream, dst16, store_f32);
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
 index 918ff4501..344bc4920 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
