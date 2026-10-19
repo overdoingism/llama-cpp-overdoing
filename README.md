@@ -41,8 +41,9 @@ All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B U
 | K1 fp8 (on top of f16) | +16% / +22% | 0.0023 / 0.0008 |
 | F8 | +3% / +17% | 0.0020 / 0.0007 |
 | M4 (MXFP4 models only) | +55% at 8K, +44% at 110K | +≈0.001 over the MXFP4 weights themselves |
+| mmvk v2 (`0006`; measured on r59, against plain r59) | — (decode: 4.5-6% less time per step with drafts) | 0.0015 / 0.0003 (below the floor) |
 
-Decode is unchanged by these three (`0006` is the decode one).  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
+K1, F8 and M4 leave decode unchanged; `0006` changes decode only (for its KLD the decode path runs it at one token, `GGML_CUDA_MMVK=4`).  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
 2-3% for Chinese text and 0.1-0.3% for English; generation reads the prompt through the KV cache and sees far less (the KLD column).
 For prompt-scoring workloads use `f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
 
