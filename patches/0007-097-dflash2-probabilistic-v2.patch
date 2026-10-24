@@ -1,0 +1,272 @@
+From 46e030e066a53e6ec53765da00439577190d47e0 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:09:38 +0800
+Subject: [PATCH] speculative: DFlash2 probabilistic drafting (opt-in), the
+ candidates cut by the request's truncation
+
+With --spec-draft-sampling probabilistic and a request temperature above 0, the DFlash2 path through the selector
+lattice is sampled at every position (as CandidateSelector.select in the z-lab reference), and the 16 candidates with
+their probabilities go to the verifier, which already does rejection sampling for draft-simple and MTP.  The target
+distribution is unchanged; greedy requests and the default greedy drafting are untouched.
+
+- The candidates are ranked by score and truncated as the default sampler chain does (top-k, then top-p on the
+  untempered probabilities, then min-p), then softmax(score / temp).  LLAMA_DFLASH_PATH_TRUNCATE=0 drops the cut.
+- One generator per sequence, reseeded from the request seed at the start of each generation; the candidates are walked
+  in token-id order (the device top-k does not fix their order), so a fixed seed reproduces the output.
+- LLAMA_DFLASH_PATH_TEMP_SCALE samples the path at temp * scale (default 1).
+
+A trade-off, off by default: sampled requests at temperature 0.7-1.0 (code, math) accept more drafted tokens; at low
+temperature (0.3) the draft is less sure than the target and accepts fewer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp          | 141 ++++++++++++++++++++++++++++++++
+ common/speculative.h            |   5 ++
+ tools/server/server-context.cpp |   3 +
+ 3 files changed, 149 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 6bee585ad..ca62dbb23 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -19,6 +19,7 @@
+ #include <cstring>
+ #include <iomanip>
+ #include <map>
++#include <random>
+ #include <cinttypes>
+ 
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -1020,6 +1021,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     bool    is_mrope       = false;
+     int32_t selector_top_k = 0;
+ 
++    // DFlash2 under --spec-draft-sampling probabilistic: the path through the selector lattice is sampled from
++    // softmax(score / temp) at every position, and the candidates with those probabilities go to the verifier for
++    // rejection sampling. One generator per sequence, seeded from the request seed on the first draft after begin().
++    std::vector<std::mt19937> path_rng;
++    std::vector<bool>         path_rng_seeded;
++    std::vector<float>        path_q;
++    std::vector<int32_t>      path_ord;
++    // the request's top-k / top-p / min-p applied to the candidates before the temperature, as the default sampler chain
++    // orders them, so the path does not propose what the target would never sample (LLAMA_DFLASH_PATH_TRUNCATE=0: off)
++    bool                      path_truncate = true;
++    std::vector<int32_t>      path_rank;
++    std::vector<float>        path_p1;
++    std::vector<uint8_t>      path_keep;
++    // the path is sampled at temp * path_temp_scale (LLAMA_DFLASH_PATH_TEMP_SCALE, default 1): any proposal keeps the
++    // target distribution, a sharper one accepts more where the drafter is less sure than the target
++    float                     path_temp_scale = 1.0f;
++
+     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
+     const bool is_dspark;
+ 
+@@ -1072,6 +1090,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         is_dflash2     = selector_top_k > 0;
+         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+ 
++        path_rng.resize(n_seq);
++        path_rng_seeded.assign(n_seq, false);
++        path_q.resize(std::max<int32_t>(selector_top_k, 1));
++        path_ord.resize(std::max<int32_t>(selector_top_k, 1));
++        path_rank.resize(std::max<int32_t>(selector_top_k, 1));
++        path_p1.resize(std::max<int32_t>(selector_top_k, 1));
++        path_keep.resize(std::max<int32_t>(selector_top_k, 1));
++
++        {
++            const char * ts = getenv("LLAMA_DFLASH_PATH_TEMP_SCALE");
++            if (ts != nullptr && atof(ts) > 0.0) {
++                path_temp_scale = (float) atof(ts);
++            }
++            const char * tr = getenv("LLAMA_DFLASH_PATH_TRUNCATE");
++            path_truncate = tr == nullptr || atoi(tr) != 0;
++        }
++
+         if (is_dspark && this->params.p_min > 0.0f) {
+             char buf[16] = {};
+             const bool has_conf =
+@@ -1086,6 +1121,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
+                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
++        if (is_dflash2) {
++            LOG_INF("%s: - DFlash2 selector top-k=%d, path %s (temp x %.2f, %s)\n", __func__, selector_top_k,
++                    this->params.probabilistic ? "sampled (probabilistic)" : "greedy", path_temp_scale,
++                    path_truncate ? "the request's top-k/top-p/min-p" : "no truncation");
++        }
+ 
+         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
+         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
+@@ -1185,6 +1225,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             return;
+         }
+ 
++        // a new generation: reseed the sampled path from its request seed, so a fixed seed reproduces the output
++        path_rng_seeded[seq_id] = false;
++
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+@@ -1353,6 +1396,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+             const int32_t n_draft = params.n_max;
+ 
++            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
++            if (!params.probabilistic || !is_dflash2) {
++                dp.result_q = nullptr;
++            }
++
+             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+             i_block_beg[seq_id] = batch.size();
+             n_block    [seq_id] = n_block_tokens;
+@@ -1389,6 +1437,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+ 
++                const bool sample_path = dp.result_q != nullptr && dp.temp > 0.0f;
++                if (sample_path && !path_rng_seeded[seq_id]) {
++                    // mixed so the stream differs from the target's own draws under the same seed
++                    path_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x27d4eb2fu);
++                    path_rng_seeded[seq_id] = true;
++                }
++
+                 int32_t predecessor = 0;
+                 for (int32_t i = 1; i < n_block_tokens; ++i) {
+                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+@@ -1396,6 +1451,86 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+                     predecessor = (int32_t) std::distance(scores,
+                             std::max_element(scores, scores + selector_top_k));
++                    if (sample_path) {
++                        // q = softmax(score / temp) over this position's candidates that survive the request's truncation,
++                        // given the sampled predecessor
++                        const float s_max = scores[predecessor];
++                        const float t_path = dp.temp * path_temp_scale;
++                        // the device top-k does not fix the candidate order: walk the candidates in token-id order, so
++                        // the same seed draws the same token
++                        for (int32_t k = 0; k < selector_top_k; ++k) {
++                            path_ord[k] = k;
++                        }
++                        std::sort(path_ord.begin(), path_ord.begin() + selector_top_k,
++                                [row](int32_t a, int32_t b) { return row[a] < row[b]; });
++                        std::fill(path_keep.begin(), path_keep.begin() + selector_top_k, 1);
++                        if (path_truncate) {
++                            // rank by score (ties by token id, so the order does not depend on the candidate order)
++                            for (int32_t k = 0; k < selector_top_k; ++k) {
++                                path_rank[k] = k;
++                            }
++                            std::sort(path_rank.begin(), path_rank.begin() + selector_top_k, [scores, row](int32_t a, int32_t b) {
++                                return scores[a] > scores[b] || (scores[a] == scores[b] && row[a] < row[b]);
++                            });
++                            int32_t n_keep = selector_top_k;
++                            if (dp.top_k > 0) {
++                                n_keep = std::min(n_keep, dp.top_k);
++                            }
++                            float z = 0.0f;
++                            for (int32_t j = 0; j < n_keep; ++j) {
++                                path_p1[j] = std::exp(scores[path_rank[j]] - s_max);
++                                z += path_p1[j];
++                            }
++                            if (dp.top_p < 1.0f) {
++                                // keep candidates until the cumulative probability reaches top_p (the one crossing it too)
++                                float cum = 0.0f;
++                                for (int32_t j = 0; j < n_keep; ++j) {
++                                    cum += path_p1[j] / z;
++                                    if (cum >= dp.top_p) {
++                                        n_keep = j + 1;
++                                        break;
++                                    }
++                                }
++                            }
++                            if (dp.min_p > 0.0f) {
++                                for (int32_t j = 1; j < n_keep; ++j) {
++                                    if (path_p1[j] < dp.min_p * path_p1[0]) {
++                                        n_keep = j;
++                                        break;
++                                    }
++                                }
++                            }
++                            for (int32_t j = n_keep; j < selector_top_k; ++j) {
++                                path_keep[path_rank[j]] = 0;
++                            }
++                        }
++                        float sum = 0.0f;
++                        for (int32_t j = 0; j < selector_top_k; ++j) {
++                            const int32_t k = path_ord[j];
++                            path_q[k] = path_keep[k] ? std::exp((scores[k] - s_max) / t_path) : 0.0f;
++                            sum += path_q[k];
++                        }
++                        float u = std::uniform_real_distribution<float>(0.0f, sum)(path_rng[seq_id]);
++                        // the last kept candidate if rounding leaves u above the sum
++                        int32_t pick = -1;
++                        for (int32_t j = 0; j < selector_top_k; ++j) {
++                            const int32_t k = path_ord[j];
++                            if (!path_keep[k]) {
++                                continue;
++                            }
++                            pick = k;
++                            u -= path_q[k];
++                            if (u < 0.0f) {
++                                break;
++                            }
++                        }
++                        // the candidates are distinct tokens, so q is a distribution over token ids
++                        auto & q = dp.result_q->emplace_back(selector_top_k);
++                        for (int32_t k = 0; k < selector_top_k; ++k) {
++                            q[k] = { (llama_token) row[k], scores[k], path_q[k] / sum };
++                        }
++                        predecessor = pick;
++                    }
+                     if (params.p_min > 0.0f) {
+                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                         float sum = 0.0f;
+@@ -1403,6 +1538,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                             sum += std::exp(scores[k] - scores[predecessor]);
+                         }
+                         if (1.0f / sum < params.p_min) {
++                            if (sample_path) {
++                                dp.result_q->pop_back();
++                            }
+                             break;
+                         }
+                     }
+@@ -1411,6 +1549,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+                 if (result.size() < (size_t) params.n_min) {
+                     result.clear();
++                    if (dp.result_q) {
++                        dp.result_q->clear();
++                    }
+                 }
+                 continue;
+             }
+diff --git a/common/speculative.h b/common/speculative.h
+index 2eaa1d744..278d08532 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -79,6 +79,11 @@ struct common_speculative_draft_params {
+     // the target's temp and seed, read only when the drafter samples probabilistically
+     float    temp = 1.0f;
+     uint32_t seed = LLAMA_DEFAULT_SEED;
++
++    // the target's truncation (<= 0, >= 1, <= 0: off); a sampled DFlash2 path applies it to its own candidates
++    int32_t top_k = 0;
++    float   top_p = 1.0f;
++    float   min_p = 0.0f;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ebdc41dcf..b09ed71be 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3437,6 +3437,9 @@ private:
+                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                             /* .temp     = */ slot.task->params.sampling.temp,
+                             /* .seed     = */ slot.task->params.sampling.seed,
++                            /* .top_k    = */ slot.task->params.sampling.top_k,
++                            /* .top_p    = */ slot.task->params.sampling.top_p,
++                            /* .min_p    = */ slot.task->params.sampling.min_p,
+                         };
+ 
+                         drafting.push_back(&slot);

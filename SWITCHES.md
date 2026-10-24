@@ -1,6 +1,7 @@
 # Switches
 
-Written with Claude (AI).  Every switch is an environment variable, read once when `llama-server` starts.  Unset means off: with
+Written with Claude (AI).  Every switch is an environment variable, read once when `llama-server` starts (0007's main switch
+is a server parameter).  Unset means off: with
 nothing set, the build behaves like plain rdna-boosts.  Set them in the shell that starts the server (`NAME=value` before the
 command in bash, `$env:NAME = "value"` in PowerShell); to turn one off, unset it.
 
@@ -16,8 +17,12 @@ command in bash, `$env:NAME = "value"` in PowerShell); to turn one off, unset it
 | `LLAMA_REASONING_GUARD` | 0004 | `1` | When the model samples an end of turn inside its reasoning block, the block's end tag (`</think>`) is emitted instead and generation goes on, so the answer lands in the reply instead of the reasoning.  Nothing before that point changes; it never shortens the reasoning, and a reply cut by `max_tokens` is left as it is.  When it fires the model usually writes its answer again after the reasoning (leave room in `max_tokens`), and the log prints `emitting the end tag`.  Needs a template whose reasoning end tag ends with one token (Qwen's `</think>`); otherwise the log says it is off. |
 | `GGML_CUDA_MMVK` | 0006 mmvk | `1`-`4` | Q4_K / Q5_K / Q6_K matmuls of 1 to 8 tokens (decode and speculative verification) run a kernel that keeps the activations in registers across several weight rows.  `2`: also launches the matmuls that read the same input (gate + up, q + k + v, DeltaNet qkv + z) as one kernel (recommended); `1`: one launch each (same numbers, about 1% slower).  `1` and `2` are on only when llama-server verifies speculative drafts (a draft model, MTP or an n-gram type): one-token decode alone is 1-1.6% faster on the stock kernel.  `3` / `4` are the same, always (also for programs other than llama-server).  The server log prints `mmvk on (...)` or `mmvk off (...)`.  Not bit-identical to the stock kernel (float summation order); decode and verification give the same results as each other. |
 | `GGML_CUDA_MMVK_EXT` | 0006 mmvk | bit mask, default `1` | `1`: groups may mix weight types.  `2`: IQ4_XS / IQ4_NL / MXFP4 through mmvk too (their stock kernel is already close to the bandwidth limit; normally leave unset). |
+| `--spec-draft-sampling probabilistic` (server parameter) | 0007 | `greedy` (default), `probabilistic` | With a DFlash2 draft and a request temperature above 0: sample the draft path and let the target verify it by rejection sampling.  Same output distribution, different tokens.  A trade-off: faster on sampled code / math at temperature 0.7-1.0, slower at 0.3 ([report](reports/2026-10-24.md)). |
+| `LLAMA_DFLASH_PATH_TRUNCATE` | 0007 | default on; `0` = off | Cut the 16 candidates by the request's top-k / top-p / min-p before the temperature.  No measurable effect either way so far. |
+| `LLAMA_DFLASH_PATH_TEMP_SCALE` | 0007 | a number, default `1` | Sample the path at temperature × this value.  0.5 and 0.25 were tried and were not better. |
 
 0001-0003 do not touch decode and draft verification: their batches are below every minimum above.  0006 is only for them.
+0007 changes only how a DFlash2 draft is drawn for sampled requests.
 
 ## Server parameters they need
 
@@ -37,6 +42,8 @@ GGML_LF_DFLASH_DEV=1
 GGML_CUDA_MMVK=2
 llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 ```
+
+0007 is not in this list: it is a trade-off, turned on per workload.
 
 ## Algorithm choice (normally unset)
 
@@ -68,7 +75,7 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 
 # 開關
 
-本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次。不設就是關：什麼都不設時，行為和原版 rdna-boosts 相同。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）；要關掉就取消設定。
+本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次（0007 的主開關是 server 參數）。不設就是關：什麼都不設時，行為和原版 rdna-boosts 相同。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）；要關掉就取消設定。
 
 ## 主要開關
 
@@ -82,8 +89,11 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 | `LLAMA_REASONING_GUARD` | 0004 | `1` | 模型在思考區裡抽到「結束回合」時，改成輸出思考區的結束標籤（`</think>`）並繼續生成，答案就會落在正文而不是思考區。在那之前的內容完全不變；不會縮短思考，被 `max_tokens` 截斷的回覆也照舊。觸發時模型通常會在思考之後把答案再寫一次（`max_tokens` 要留餘裕），log 會印 `emitting the end tag`。需要模板的思考結束標籤以單一 token 結尾（Qwen 的 `</think>`），否則 log 會說它沒開。 |
 | `GGML_CUDA_MMVK` | 0006 mmvk | `1`～`4` | Q4_K／Q5_K／Q6_K 在 1～8 個 token 時的矩陣乘（decode 與推測解碼的驗證）改用 mmvk：activation 留在暫存器裡，給多列權重重複使用。`2`：讀同一個輸入的矩陣乘（gate＋up、q＋k＋v、DeltaNet qkv＋z）合併成一次發射（建議）；`1`：各自發射（數值相同，約慢 1%）。`1`、`2` 只在 llama-server 驗證推測解碼草稿時開（草稿模型、MTP 或 ngram）：只有單 token decode 時原版 kernel 快 1～1.6%。`3`／`4` 相同但一律開（llama-server 以外的程式也適用）。server log 會印 `mmvk on (...)` 或 `mmvk off (...)`。和原版 kernel 不逐位元相同（浮點加總順序不同）；decode 與驗證彼此一致。 |
 | `GGML_CUDA_MMVK_EXT` | 0006 mmvk | 位元，預設 `1` | `1`：合併發射可混合不同權重型別。`2`：IQ4_XS／IQ4_NL／MXFP4 也走 mmvk（這些型別的原版 kernel 已接近頻寬上限，平常不設）。 |
+| `--spec-draft-sampling probabilistic`（server 參數） | 0007 | `greedy`（預設）、`probabilistic` | 使用 DFlash2 草稿、且請求溫度大於 0 時：草稿路徑改成抽樣，由目標模型以拒絕取樣驗證。輸出分布不變，但 token 會不同。屬於取捨：溫度 0.7～1.0 的寫程式／數學變快，溫度 0.3 變慢（[報告](reports/2026-10-24.md)）。 |
+| `LLAMA_DFLASH_PATH_TRUNCATE` | 0007 | 預設開；`0` 為關 | 先依請求的 top-k／top-p／min-p 截掉 16 個候選，再套溫度。目前量不到差別。 |
+| `LLAMA_DFLASH_PATH_TEMP_SCALE` | 0007 | 數字，預設 `1` | 路徑用「溫度 × 此值」抽樣。試過 0.5、0.25，沒有比較好。 |
 
-0001～0003 不影響 decode 與草稿驗證：它們的批次都低於上面的下限。0006 只作用在這兩者。
+0001～0003 不影響 decode 與草稿驗證：它們的批次都低於上面的下限。0006 只作用在這兩者。0007 只改變取樣請求的 DFlash2 草稿怎麼抽。
 
 ## 需要配合的 server 參數
 
@@ -94,7 +104,7 @@ llama-server ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 
 ## 全開（基準測試用的設定）
 
-見上方英文段的區塊：`GGML_LF_KQ_BLAS=fp8`、`GGML_LF_FA_FP8=1`、`GGML_LF_MXFP4_DIRECT=blaslt`、`GGML_LF_DRAFT_UB=512`、`GGML_LF_DFLASH_DEV=1`、`GGML_CUDA_MMVK=2`，加上 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0`。
+見上方英文段的區塊：`GGML_LF_KQ_BLAS=fp8`、`GGML_LF_FA_FP8=1`、`GGML_LF_MXFP4_DIRECT=blaslt`、`GGML_LF_DRAFT_UB=512`、`GGML_LF_DFLASH_DEV=1`、`GGML_CUDA_MMVK=2`，加上 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0`。0007 不在其中：它是取捨性項目，依工作負載決定要不要開。
 
 ## 演算法選擇（平常不設）
 

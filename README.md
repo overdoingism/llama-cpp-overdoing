@@ -2,7 +2,8 @@
 
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
 for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, a faster decode / draft-verification
-matmul, an opt-in guard against replies that end inside the reasoning, and fixes of upstream llama.cpp code that we keep here.
+matmul, an opt-in guard against replies that end inside the reasoning, an opt-in sampled DFlash2 draft, and fixes of upstream
+llama.cpp code that we keep here.
 Other bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
@@ -20,8 +21,11 @@ the previous base (`v16-a55e952b8-rN`).
 | `0004-097-reasoning-guard-v1` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts) | `LLAMA_REASONING_GUARD=1` | guard | — |
 | `0005-097-backend-sampling-reserve-v1` | with `--backend-sampling`, the compute buffers are reserved once per sequence instead of being freed and allocated again for every request (upstream llama.cpp behavior; about 0.25 s per request on a 27B model at `-ub 2048`) | always on | fix | — |
 | `0006-097-mmvk-v2` | Q4_K / Q5_K / Q6_K matmuls of 1 to 8 tokens (decode and speculative verification) keep the activations in registers across several weight rows, and the matmuls that read the same input go out as one launch; not bit-identical to the stock kernel (float summation order), KLD below the run-to-run floor.  On only when llama-server verifies drafts (draft model, MTP or n-gram): one-token decode alone is faster on the stock kernel | `GGML_CUDA_MMVK=2` (`4`: also without drafts) | speed/diff | 0001, 0003 (context) |
+| `0007-097-dflash2-probabilistic-v2` | with a DFlash2 draft (`--spec-type draft-dflash`) and a request temperature above 0, the draft path is sampled from its candidates (first cut by the request's top-k / top-p / min-p) and the target verifies it by rejection sampling, as llama.cpp already does for draft-simple and MTP.  The output follows the same distribution but is not the same tokens as with greedy drafting; greedy requests are untouched.  **A trade-off**: faster on sampled code / math at temperature 0.7-1.0, slower on low-temperature agent turns (see the 2026-10-24 report) | server parameter `--spec-draft-sampling probabilistic` | speed/trade-off | — |
 
-Type: `speed/lossy` = faster, with error above the run-to-run floor; `speed/diff` = faster, output not bit-identical to the stock code but within the floor; `guard` = changes behavior only in a failure case; `fix` = a bug fix.
+Type: `speed/lossy` = faster, with error above the run-to-run floor; `speed/diff` = faster, output not bit-identical to the stock code but within the floor; `guard` = changes behavior only in a failure case; `fix` = a bug fix; `speed/trade-off` = faster on some workloads and slower on others, so off unless you ask for it.
+
+**2026-10-24:** new `0007`: DFlash2 probabilistic drafting, **a trade-off, off by default** (`--spec-draft-sampling probabilistic`).  A sampled request's draft is sampled too and verified by rejection sampling: same output distribution, different tokens.  Code / math at temperature 0.7-1.0 got faster (+11% to +31% on r59, +5% to +17% on r115); low-temperature agent turns got slower (−3.9% at 0.3).  Measure on your own workload.  See the [report](reports/2026-10-24.md).
 
 **2026-10-19:** `0001` K1 v3.3: the fp8 path's activation pass is cheaper (the largest channels chosen by a pairwise merge, and the per-channel maximum taken by the GLU kernels that write the activation).  The output is bit-identical to v3.2; prefill +2.1% / +3.3% / +2.5% at 8K / 32K / 64K (production setup).  No new switch.  See the [report](reports/2026-10-19.md).
 
@@ -33,7 +37,7 @@ Type: `speed/lossy` = faster, with error above the run-to-run floor; `speed/diff
 
 **2026-10-14:** `0002` F8 v3.3 fixes prompts prefilled together in one batch (`--parallel` ≥ 2): v3.1 and v3.2 zeroed the other sequences' attention in the F8 layers.  One sequence gives the same output as v3.2.  The `a55` file still has the bug: use `--parallel 1` with it.
 
-All are off unless the variable is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt, on
+All are off unless the variable (for `0007`, the server parameter) is set.  Measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt, on
 `v16-a55e952b8-r8` (the patch code is the same on r50; speeds on r50 are in History, the quality check on r50 is in its report):
 
 | | prefill | KLD vs official UD-Q5_K_M (zh / en) |

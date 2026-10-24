@@ -21,7 +21,7 @@ $k = Get-ChildItem (Split-Path $root) -Recurse -Directory -Filter gfx1201 | Wher
 Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201, next to llama-server.exe
 ```
 
-- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0004 and 0005 stand alone).  The patches add `.cu` files: after applying, always run the configure step again.
+- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0004, 0005 and 0007 stand alone).  The patches add `.cu` files: after applying, always run the configure step again.
 - For r50, use the files in `patches/r50/` (plus the top-level `0004` if wanted).  For a `v16-a55e952b8-rN` release, check out
   `a55e952b8` and use `patches/a55/`.
 - The configure step may log `UI: download dist.tar.gz... failed` (it tries to fetch the web UI); harmless, the build
@@ -45,7 +45,7 @@ Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201,
 
 1. **clone 之前**先設 `git config --global core.autocrlf false`，patch 需要 LF 換行。
 2. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `097cf33d9`；clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v12-097cf33d9-r59`（r51 以後皆可；r50 改用 `patches/r50/`；舊基底 `v16-a55e952b8-rN` 要 checkout `a55e952b8`，改用 `patches/a55/`），用 Git for Windows 的 `bash` 在 llama.cpp 目錄執行 `apply-all.sh .`。
-3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0004、0005 可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
+3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0004、0005、0007 可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
 4. cmake 用 Ninja，`-DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON`，編譯器與 `CMAKE_PREFIX_PATH` 指向 ROCm SDK（見上方指令）。
 5. **`GGML_HIP_NO_VMM` 一定要保持 ON**：設成 OFF 時，長上下文會溢出到共用 GPU 記憶體，prefill 掉到約四分之一。`GGML_HIP_LF_HIPBLASLT` 保持預設 ON。
 6. 編 `llama-server`。
