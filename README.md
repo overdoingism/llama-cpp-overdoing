@@ -15,13 +15,13 @@ the previous base (`v16-a55e952b8-rN`).
 
 | patch | what | switch | default | type |
 |---|---|---|---|---|
-| `0001-097-k1-v3.3` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS` | off | lossy |
-| `0002-097-f8-v3.3` | fp8 prefill attention | `GGML_LF_FA_FP8` | off | lossy |
-| `0003-097-m4-v2` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT` | off | lossy |
+| `0001-097-k1-v3.3` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS` | off | speed/<br>lossy |
+| `0002-097-f8-v3.3` | fp8 prefill attention | `GGML_LF_FA_FP8` | off | speed/<br>lossy |
+| `0003-097-m4-v2` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT` | off | speed/<br>lossy |
 | `0004-097-reasoning-guard-v1` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD` | off | guard |
 | `0005-097-backend-sampling-reserve-v1` | no buffer reallocation per request | — | on | fix |
-| `0006-097-mmvk-v2` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK` | off | diff |
-| `0007-097-dflash2-probabilistic-v2` | sampled DFlash2 drafts | `--spec-draft-sampling` | off | trade-off |
+| `0006-097-mmvk-v2` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK` | off | speed/<br>diff |
+| `0007-097-dflash2-probabilistic-v2` | sampled DFlash2 drafts | `--spec-draft-sampling` | off | speed/<br>trade-off |
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
