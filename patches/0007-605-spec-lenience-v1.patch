@@ -1,0 +1,171 @@
+From 655efa4cb3b5239e7e5031178845cfb9d5d35778 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 05:40:20 +0800
+Subject: [PATCH] speculative: the lenience of rejection-sampling verification
+ (spec_lenience, LLAMA_SPEC_LENIENCE; lossy, 1 = exact)
+
+With sampled drafts (--spec-draft-sampling probabilistic) a drafted token is accepted with probability
+min(1, p / (l q)) instead of min(1, p / q); the residual norm(max(0, p - q)) is unchanged, so no token becomes more than
+1/l times as likely as under the target (Leviathan et al. 2023, lenience).  l comes from the request field
+spec_lenience, or LLAMA_SPEC_LENIENCE for requests that leave it at 1 (clients that cannot send the field).  At l = 1
+the draws are the same as before.  The server log reports, per request, the drafted tokens accepted only through the
+lenience.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/common.h                 |  6 ++++++
+ common/sampling.cpp             | 38 +++++++++++++++++++++++++++++++--
+ common/sampling.h               |  5 +++++
+ tools/server/server-context.cpp |  8 +++++++
+ tools/server/server-schema.cpp  | 11 ++++++++++
+ 5 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/common/common.h b/common/common.h
+index ec1dd017b..470faafe3 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -300,6 +300,12 @@ struct common_params_sampling {
+ 
+     bool backend_sampling = false;
+ 
++    // speculative verification with sampled drafts (--spec-draft-sampling probabilistic): a drafted token is accepted with
++    // probability min(1, p / (spec_lenience * q)) (the lenience of Leviathan et al. 2023): 1 = exact, below 1 lossy, no token
++    // more than 1/spec_lenience times as likely as under the target.  LLAMA_SPEC_LENIENCE sets it for requests that leave it
++    // at 1.
++    float spec_lenience = 1.0f;
++
+     // print the parameters into a string
+     std::string print() const;
+ };
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 6b6bebc0b..1ebc3bea7 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -331,6 +331,10 @@ struct common_sampler {
+     llama_tokens              rguard_start = {};
+     std::vector<llama_tokens> rguard_ends  = {};
+     llama_tokens              rguard_tail  = {};       // the last generated tokens, as many as the longest tag
++
++    // params.spec_lenience below 1: drafted tokens accepted only through the lenience, and the sum of log(p / q) over them
++    int32_t                   lenience_n   = 0;
++    double                    lenience_sum = 0.0;
+ };
+ 
+ static bool rguard_tail_matches(const llama_tokens & tail, const llama_tokens & tag) {
+@@ -1042,9 +1046,26 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+     return 0.0f;
+ }
+ 
++float common_sampler_lenience(const struct common_sampler * gsmpl) {
++    static const float l_env = [] {
++        const char * e = getenv("LLAMA_SPEC_LENIENCE");
++        const double v = e != nullptr ? atof(e) : 1.0;
++        return v > 0.0 && v < 1.0 ? (float) v : 1.0f;
++    }();
++    const float l = gsmpl->params.spec_lenience;
++    return l > 0.0f && l < 1.0f ? l : l_env;
++}
++
++void common_sampler_lenience_stats(const struct common_sampler * gsmpl, int32_t * n, double * sum_log_ratio) {
++    *n             = gsmpl->lenience_n;
++    *sum_log_ratio = gsmpl->lenience_sum;
++}
++
+ // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+ // Preserves the target distribution exactly, and accepts more often than matching does when the
+-// draft samples instead of taking its argmax.
++// draft samples instead of taking its argmax.  With a lenience l < 1 (common_sampler_lenience) the
++// acceptance is min(1, p/(l*q)) and the residual stays the same: lossy, no token more than 1/l times
++// as likely as under the target.
+ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+@@ -1052,6 +1073,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
+     std::vector<llama_token> result;
+     result.reserve(idxs.size());
+ 
++    const float l = common_sampler_lenience(gsmpl);
++
+     // draws come from the sampler's own stream, so they stay independent of what was drafted
+     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+ 
+@@ -1104,7 +1127,18 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
+             }
+         }
+ 
+-        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
++        // with l = 1 the same draws as min(1, p/q): a uniform only where p < q
++        bool accept = q_x > 0.0f && p_x >= l*q_x;
++        if (q_x > 0.0f && !accept) {
++            const float u = uni(gsmpl->rng);
++            accept = u < p_x / (l*q_x);
++            if (accept && u >= p_x / q_x) {
++                gsmpl->lenience_n++;
++                gsmpl->lenience_sum += std::log(std::max(1e-30, (double) p_x / q_x));
++            }
++        }
++
++        if (accept) {
+             const llama_token id = rguard_apply(gsmpl, draft[i]);
+             common_sampler_accept(gsmpl, id, true);
+             result.push_back(id);
+diff --git a/common/sampling.h b/common/sampling.h
+index f19bd27c4..8bec28fa9 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -85,6 +85,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ //
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+ 
++// the lenience of rejection-sampling verification: params.spec_lenience, or LLAMA_SPEC_LENIENCE where that is 1; and the
++// drafted tokens accepted only through it with the sum of log(p / q) over them
++float common_sampler_lenience(const struct common_sampler * gsmpl);
++void  common_sampler_lenience_stats(const struct common_sampler * gsmpl, int32_t * n, double * sum_log_ratio);
++
+ // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
+ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 936d718e4..51492cd37 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -771,6 +771,14 @@ struct server_slot {
+                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
+                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
+ 
++        if (smpl && common_sampler_lenience(smpl.get()) < 1.0f) {
++            int32_t n_len   = 0;
++            double  sum_len = 0.0;
++            common_sampler_lenience_stats(smpl.get(), &n_len, &sum_len);
++            SLT_INF(*this, " lenience accept = %10d draft tokens accepted only through the lenience (l = %.4f), mean log(p / q) %.3f\n",
++                    n_len, common_sampler_lenience(smpl.get()), n_len > 0 ? sum_len / n_len : 0.0);
++        }
++
+         const int32_t n_draft_total       = stats.n_draft_tokens;
+         const int32_t n_draft_accepted    = stats.n_draft_accepted;
+         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 0a14a9620..7590895a8 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -228,6 +228,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
+ #endif
+ 
++    // lossy experiment: the lenience of rejection-sampling verification (see common_params_sampling::spec_lenience)
++    add((new field_json("spec_lenience"))
++        ->set_desc("Lossy. With sampled drafts (--spec-draft-sampling probabilistic), accept a draft token with probability min(1, p / (spec_lenience * q)); 1 = exact (default), lower = more lenient, in (0, 1]")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            const float l = data.at("spec_lenience").get<float>();
++            if (!(l > 0.0f && l <= 1.0f)) {
++                throw std::runtime_error("spec_lenience: expected a number in (0, 1]");
++            }
++            ctx.params.sampling.spec_lenience = l;
++        }));
++
+     add((new field_json("lora"))
+         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+-- 
+2.43.0
+
