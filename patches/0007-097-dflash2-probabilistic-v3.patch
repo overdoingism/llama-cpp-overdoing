@@ -1,6 +1,6 @@
-From 46e030e066a53e6ec53765da00439577190d47e0 Mon Sep 17 00:00:00 2001
+From dea399374f70d0acb5e73ae779b8f96682e45de8 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
-Date: Sat, 24 Oct 2026 23:09:38 +0800
+Date: Tue, 27 Oct 2026 01:46:48 +0800
 Subject: [PATCH] speculative: DFlash2 probabilistic drafting (opt-in), the
  candidates cut by the request's truncation
 
@@ -14,19 +14,23 @@ distribution is unchanged; greedy requests and the default greedy drafting are u
 - One generator per sequence, reseeded from the request seed at the start of each generation; the candidates are walked
   in token-id order (the device top-k does not fix their order), so a fixed seed reproduces the output.
 - LLAMA_DFLASH_PATH_TEMP_SCALE samples the path at temp * scale (default 1).
+- v3: with --spec-draft-p-min above 0, a sampled path stops at the probability of the position's most likely candidate,
+  read before the draw, and a draft shorter than --spec-draft-n-min is kept.  v2 stopped at the drawn token's
+  probability, so whether a token was drafted depended on which token was drawn and the output no longer followed the
+  target distribution.  With the default p-min 0 v2 and v3 behave the same.
 
 A trade-off, off by default: sampled requests at temperature 0.7-1.0 (code, math) accept more drafted tokens; at low
 temperature (0.3) the draft is less sure than the target and accepts fewer.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- common/speculative.cpp          | 141 ++++++++++++++++++++++++++++++++
+ common/speculative.cpp          | 150 +++++++++++++++++++++++++++++++-
  common/speculative.h            |   5 ++
  tools/server/server-context.cpp |   3 +
- 3 files changed, 149 insertions(+)
+ 3 files changed, 156 insertions(+), 2 deletions(-)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 6bee585ad..ca62dbb23 100644
+index 6bee585ad..96a735b32 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -19,6 +19,7 @@
@@ -133,10 +137,13 @@ index 6bee585ad..ca62dbb23 100644
                  int32_t predecessor = 0;
                  for (int32_t i = 1; i < n_block_tokens; ++i) {
                      const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-@@ -1396,6 +1451,86 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1396,21 +1451,112 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
  
                      predecessor = (int32_t) std::distance(scores,
                              std::max_element(scores, scores + selector_top_k));
++                    // p_min stops at the argmax's probability also when the path is sampled: a stop that depended on the
++                    // drawn token would draft from a distribution other than q, and the verification would not be exact
++                    const int32_t i_max = predecessor;
 +                    if (sample_path) {
 +                        // q = softmax(score / temp) over this position's candidates that survive the request's truncation,
 +                        // given the sampled predecessor
@@ -220,8 +227,9 @@ index 6bee585ad..ca62dbb23 100644
                      if (params.p_min > 0.0f) {
                          // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                          float sum = 0.0f;
-@@ -1403,6 +1538,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-                             sum += std::exp(scores[k] - scores[predecessor]);
+                         for (int32_t k = 0; k < selector_top_k; ++k) {
+-                            sum += std::exp(scores[k] - scores[predecessor]);
++                            sum += std::exp(scores[k] - scores[i_max]);
                          }
                          if (1.0f / sum < params.p_min) {
 +                            if (sample_path) {
@@ -230,9 +238,13 @@ index 6bee585ad..ca62dbb23 100644
                              break;
                          }
                      }
-@@ -1411,6 +1549,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     result.push_back((llama_token) row[predecessor]);
+                 }
  
-                 if (result.size() < (size_t) params.n_min) {
+-                if (result.size() < (size_t) params.n_min) {
++                // a sampled path keeps a draft shorter than n_min: its length follows the drawn tokens, so dropping it
++                // would again make what is drafted depend on what was drawn
++                if (result.size() < (size_t) params.n_min && !sample_path) {
                      result.clear();
 +                    if (dp.result_q) {
 +                        dp.result_q->clear();
@@ -270,3 +282,6 @@ index ebdc41dcf..b09ed71be 100644
                          };
  
                          drafting.push_back(&slot);
+-- 
+2.43.0
+

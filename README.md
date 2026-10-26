@@ -21,7 +21,7 @@ the previous base (`v16-a55e952b8-rN`).
 | `0004-097-reasoning-guard-v1` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD` | off | guard |
 | `0005-097-backend-sampling-reserve-v1` | no buffer reallocation per request | — | on | fix |
 | `0006-097-mmvk-v2` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK` | off | speed/<br>diff |
-| `0007-097-dflash2-probabilistic-v2` | sampled DFlash2 drafts | `--spec-draft-sampling` | off | speed/<br>trade-off |
+| `0007-097-dflash2-probabilistic-v3` | sampled DFlash2 drafts | `--spec-draft-sampling` | off | speed/<br>trade-off |
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
