@@ -22,9 +22,12 @@ the command in bash, `$env:NAME = "value"` in PowerShell).
 | `GGML_CUDA_MMVK_EXT` | 0006 mmvk | `1` | bit mask | `1`: groups may mix weight types.  `2`: IQ4_XS / IQ4_NL / MXFP4 through mmvk too (their stock kernel is already close to the bandwidth limit; normally leave it). |
 | `LLAMA_SPEC_LENIENCE` | 0007 | off (`1`) | a number between 0 and 1 | **Lossy.**  With sampled drafts (llama.cpp's own `--spec-draft-sampling probabilistic`) and a request temperature above 0, a drafted token is accepted with probability min(1, p / (l·q)) instead of min(1, p / q); the rest of the verification is unchanged, so no token becomes more than 1/l times as likely as under the model.  The request field `spec_lenience` sets it per request.  Has no effect at temperature 0 or with greedy drafts.  See the [2026-10-27 report](reports/2026-10-27.md) for what `0.8663` did to speed and quality. |
 | `GGML_CUDA_FA_BAND_SPLIT` | 0009 | on | `1`, `0` | RDNA4: a draft-verification batch of 9 to 16 query rows (two slots of a unified KV cache verifying at once, or an n-gram draft longer than 7) runs its attention as two halves of at most 8 rows through the decode / verify kernel instead of the generic one.  Each row gets the result a batch of 8 rows or fewer gives (not bit-identical to the generic kernel).  Only with `-fa on`, from `GGML_CUDA_FA_BAND_SPLIT_MIN_KV` KV cells (default `8192`; `0` = any length): below that the two launches cost more than they save. |
+| `LLAMA_DFLASH_ADAPTIVE` | 0012 | on | `1`, `2`, `0` | DFlash2 drafts each sequence's own width (1 to `--spec-draft-n-max`) from running acceptance estimates; the output does not change.  `2` also logs the width changes and, per request, the verifications per width.  `0`: the fixed width.  `LLAMA_DFLASH_ADAPTIVE_COST` (`0.035`) and `LLAMA_DFLASH_ADAPTIVE_JUMP` (`0.08`) set the cost model. |
+| `LLAMA_SPEC_NGRAM_SHADOW` | 0014 | `24` | a number; `0` = off | Only with an n-gram type ahead of a model drafter (`--spec-type ngram-mod,draft-dflash`).  The n-gram drafts are held back until they have predicted this many of the model's tokens in a row; then they are verified (up to `--spec-ngram-mod-n-max`) without DFlash2, until one misses.  `0`: the n-gram drafts always go first, as upstream.  `LLAMA_SPEC_NGRAM_SHADOW_EXACT=1` cuts them to 7 tokens, so the greedy output is the one without the n-gram type. |
+| `LLAMA_SPEC_ALIGN` | 0015 | on | `1`, `0` | Hybrid / recurrent models only: sequences that verify drafts in the same batch send drafts of one length (DFlash2's adaptive width aligns up to the others, up to `--spec-draft-n-max`; a longer draft is cut to the shortest), so the verify batch is not split into ubatches. |
 
 0001-0003 do not touch decode and draft verification: their batches are below every minimum above.  0006 and 0009 are only
-for them.  0007 changes only how sampled drafts are accepted.
+for them.  0007 changes only how sampled drafts are accepted; 0012, 0014 and 0015 only what is drafted.
 
 ## Server parameters they need
 
@@ -32,6 +35,7 @@ for them.  0007 changes only how sampled drafts are accepted.
 |---|---|
 | `-ub 2048 -b 2048` | K1 takes only batches of 1024 tokens or more; 2048 is the fastest.  The main model's compute buffer grows by about 1.1 MiB per ubatch token: lower it (e.g. 1536) if a long context does not fit. |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 runs only on a q8_0 KV cache with flash attention. |
+| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | Only for 0014: an n-gram type before DFlash2.  Without it 0014 does nothing. |
 | `--spec-draft-sampling probabilistic` | Only for 0007.  llama.cpp's own parameter: sample the draft and verify it by rejection sampling (exact).  Faster on sampled code / math at temperature 0.7-1.0, can be slower at low temperature: measure on your own workload. |
 
 ## Turning everything off

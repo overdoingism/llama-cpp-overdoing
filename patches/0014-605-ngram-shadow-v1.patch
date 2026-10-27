@@ -1,0 +1,178 @@
+From 958b3d5c990b938dbe2850602f494b2ea3be75ee Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:10:57 +0800
+Subject: [PATCH] speculative: shadow n-gram drafting, on by default at 24
+ tokens
+
+With an n-gram speculator ahead of a model drafter (--spec-type ngram-mod,draft-dflash), a sequence's n-gram drafts are
+held back and compared with what the target then writes.  Once they have predicted 24 of the target's tokens in a row,
+the sequence is copying and its n-gram drafts go to verification without the model drafter, until one misses.  Content
+that is not being copied is drafted by DFlash2 alone, so a wrong n-gram guess never replaces its draft or widens the
+verify batch.  Without an n-gram speculator nothing changes.
+
+Qwen3.8-27B UD-Q4_K_XL + DFlash2, ngram-mod n-max 15 / n-min 8, one request at a time: all +10.6 %, whole-file rewrites
++38..+68 %, opencode turns and ERP requests within +-1 %.  The threshold sweep: 12 took two ERP answers for copying
+(-28..-30 %), 24 leaves no group slower.  Not bit-identical: a copying step verifies up to 16 rows, whose kernels differ
+from decode's, so a near-tie can resolve differently (KLD / PPL of those wide steps at the level of a normal prefill).
+Next to a slot that is not copying, the verify batch has two lengths and splits on a hybrid target (the other slot -47 %);
+0015 removes that.
+
+LLAMA_SPEC_NGRAM_SHADOW=T sets the threshold (0: the old n-gram-first behaviour); unset with GGML_LF_ALL=0: off.
+LLAMA_SPEC_NGRAM_SHADOW_EXACT=1 cuts a copying sequence's n-gram drafts to 7 tokens: within 8 rows the greedy output is
+the one without the n-gram speculator (copying then gains about half).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 108 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 108 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 492cc3e0a..622239f91 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2882,6 +2882,13 @@ struct common_speculative {
+     std::vector<common_speculative_impl *> impl_last;
+ 
+     std::vector<double> synth_probs;
++
++    // LLAMA_SPEC_NGRAM_SHADOW (common_speculative_ngram_shadow), per seq: the last n-gram draft, the history length and
++    // the token it continued, and how many of the target's tokens the n-gram drafts have predicted in a row
++    std::vector<llama_tokens> shadow_g;
++    std::vector<size_t>       shadow_len;
++    std::vector<llama_token>  shadow_last;
++    std::vector<int32_t>      shadow_run;
+ };
+ 
+ static common_ngram_map get_common_ngram_map(
+@@ -3521,6 +3528,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+         /* .impls       = */ std::move(impls),
+         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+         /* .synth_probs = */ {},
++        /* .shadow_g    = */ {},
++        /* .shadow_len  = */ {},
++        /* .shadow_last = */ {},
++        /* .shadow_run  = */ {},
+     });
+ 
+     const int32_t n_max_configured = common_speculative_n_max(&params);
+@@ -3603,6 +3614,67 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+     return result;
+ }
+ 
++static bool common_speculative_type_is_ngram(common_speculative_type t) {
++    return t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
++           t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
++           t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
++}
++
++// LLAMA_SPEC_NGRAM_SHADOW=T (default 24; 0: off), for an n-gram speculator ahead of a model drafter (DFlash2): a
++// sequence's n-gram drafts are held back and only compared with what the target then writes.  Once they have predicted
++// T of the target's tokens in a row the sequence is copying, and its n-gram drafts go to verification -- the model
++// drafter does not run -- until one misses.  Content that is not being copied is drafted by the model drafter alone, as
++// without the n-gram speculator, so a wrong n-gram guess never replaces its draft and never widens the verify batch.
++// (Qwen3.8-27B + DFlash2: 12 is low enough to take ERP tool output for copying; 24 leaves no request group slower.)
++static int32_t common_speculative_ngram_shadow() {
++    static const int32_t v = [] {
++        const char * e = getenv("LLAMA_SPEC_NGRAM_SHADOW");
++        if (e != nullptr) {
++            return std::max(0, atoi(e));
++        }
++        const char * a = getenv("GGML_LF_ALL"); // GGML_LF_ALL=0: off unless set
++        return a != nullptr && a[0] == '0' && a[1] == '\0' ? 0 : 24;
++    }();
++    return v;
++}
++
++// LLAMA_SPEC_NGRAM_SHADOW_EXACT=1: a copying sequence's n-gram drafts are cut to 7 tokens, so the verify batch stays
++// within 8 rows.  Wider verify batches take other matmul and attention kernels (mmq, the generic WMMA tile), whose
++// reduction order differs from decode's, so a near-tie can resolve differently; within 8 rows the greedy output is the
++// one without the n-gram speculator.  Copying gains less (about +18 % on whole-file re-output instead of +40 %).
++static bool common_speculative_ngram_shadow_exact() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SPEC_NGRAM_SHADOW_EXACT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return v;
++}
++
++// compares the last n-gram draft of seq_id with the tokens the target wrote after the token it continued (the history
++// past that token and the new id_last), then starts the record for this step
++static void common_speculative_shadow_observe(common_speculative * spec, llama_seq_id seq_id, const common_speculative_draft_params & dp) {
++    auto & g   = spec->shadow_g[seq_id];
++    auto & run = spec->shadow_run[seq_id];
++
++    const llama_tokens & h  = *dp.prompt;
++    const size_t         l0 = spec->shadow_len[seq_id];
++    if (g.empty() || h.size() <= l0 || h[l0] != spec->shadow_last[seq_id]) {
++        run = 0; // no draft to check, or another request
++    } else {
++        const size_t n_new = h.size() - l0;   // h[l0 + 1 ..] and id_last
++        const size_t n_cmp = std::min(g.size(), n_new);
++        size_t m = 0;
++        while (m < n_cmp && g[m] == (l0 + 1 + m < h.size() ? h[l0 + 1 + m] : dp.id_last)) {
++            m++;
++        }
++        run = m == n_cmp ? run + (int32_t) m : 0;
++    }
++
++    g.clear();
++    spec->shadow_len [seq_id] = h.size();
++    spec->shadow_last[seq_id] = dp.id_last;
++}
++
+ void common_speculative_draft(common_speculative * spec) {
+     if (spec == nullptr) {
+         return;
+@@ -3610,6 +3682,29 @@ void common_speculative_draft(common_speculative * spec) {
+ 
+     auto & dparams = spec->dparams;
+ 
++    // shadow mode: only with an n-gram speculator and another drafter after it
++    int32_t shadow = common_speculative_ngram_shadow();
++    if (shadow > 0) {
++        bool has_ngram = false;
++        bool has_model = false;
++        for (auto & impl : spec->impls) {
++            (common_speculative_type_is_ngram(impl->type) ? has_ngram : has_model) = true;
++        }
++        shadow = has_ngram && has_model ? shadow : 0;
++    }
++    if (shadow > 0) {
++        const size_t n = dparams.size();
++        spec->shadow_g.resize(n);
++        spec->shadow_len.resize(n, 0);
++        spec->shadow_last.resize(n, LLAMA_TOKEN_NULL);
++        spec->shadow_run.resize(n, 0);
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n; ++seq_id) {
++            if (dparams[seq_id].drafting) {
++                common_speculative_shadow_observe(spec, seq_id, dparams[seq_id]);
++            }
++        }
++    }
++
+     {
+         int n_drafting = 0;
+ 
+@@ -3644,6 +3739,19 @@ void common_speculative_draft(common_speculative * spec) {
+ 
+             auto & result = *dp.result;
+ 
++            // shadow mode: the n-gram draft is recorded; it is held back unless the sequence is copying
++            if (shadow > 0 && !result.empty() && common_speculative_type_is_ngram(impl->type)) {
++                spec->shadow_g[seq_id] = result;
++                if (spec->shadow_run[seq_id] < shadow) {
++                    result.clear();
++                    n_drafting++;
++                    continue;
++                }
++                if (common_speculative_ngram_shadow_exact() && result.size() > 7) {
++                    result.resize(7);
++                }
++            }
++
+             // a new draft has been sampled
+             if (dp.drafting && !result.empty()) {
+                 dp.drafting = false;
+-- 
+2.43.0
+

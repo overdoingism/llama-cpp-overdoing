@@ -1,0 +1,273 @@
+From 0b5970862d2126014ed63a30e938baf00322a297 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:10:57 +0800
+Subject: [PATCH] speculative: sequences verifying in one batch send drafts of
+ one length on hybrid targets (LLAMA_SPEC_ALIGN)
+
+On a hybrid or recurrent target llama_decode splits a batch whose sequences differ in length into ubatches of equal
+length, so a verify step of two slots with different draft lengths runs the weights twice.  Qwen3.8-27B, two slots
+decoding at once: with 0012's adaptive width (each slot its own width) -16 % at 8K and -23 % at 50K; next to a slot
+copying with 0014's 16-row n-gram drafts the other slot ran 47 % slower.
+
+0012's adaptive width: sequences drafted together all send the widest width among them, and at least the length of a
+draft another drafter already made for the batch (a copying sequence's n-gram draft), up to --spec-draft-n-max.  Then,
+in common_speculative_draft, the drafts of one call are cut to the shortest when they still differ; the implementation
+that made a cut draft is told (truncated()), so DFlash2's acceptance estimates count only verified positions.
+
+With it, two slots at once: 8K +0.1 % and 50K within noise against fixed width 5 (0012 on); a copying slot next to a zh
+slot: copying +32 %, the zh slot +0.9 %, the pair +24.8 % against DFlash2 alone (0012 and 0014 on).  Only on hybrid /
+recurrent targets; LLAMA_SPEC_ALIGN=0 turns it off, and unset with GGML_LF_ALL=0 it is off.  Needs 0012 and 0014 (context).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 120 +++++++++++++++++++++++++++++++++++++++--
+ common/speculative.h   |   4 ++
+ 2 files changed, 119 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 622239f91..8e8a9b7e7 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -179,6 +179,27 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
+ //
+ // each implementation has a unique type and a state that is implementation-specific
+ // in a subclass of common_speculative_impl
++// LLAMA_SPEC_ALIGN (on unless 0): sequences that verify drafts in the same batch send drafts of one length.  On a hybrid
++// or recurrent target llama_decode splits a batch whose sequences differ in length into ubatches of equal length, so a
++// verify step of two slots with different widths ran the weights twice (Qwen3.8-27B, two slots decoding at once: -16 %
++// at 8K and -23 % at 50K per slot with DFlash2's adaptive width; next to a slot copying with 16-row n-gram drafts the
++// other slot ran 47 % slower).  Other targets keep unequal lengths in one ubatch, so nothing changes there.
++static bool common_speculative_align_wanted(const llama_context * ctx_tgt) {
++    static const bool env = [] {
++        const char * e = getenv("LLAMA_SPEC_ALIGN");
++        if (e != nullptr) {
++            return atoi(e) != 0;
++        }
++        const char * a = getenv("GGML_LF_ALL"); // GGML_LF_ALL=0: off unless set
++        return !(a != nullptr && a[0] == '0' && a[1] == '\0');
++    }();
++    if (!env || ctx_tgt == nullptr) {
++        return false;
++    }
++    const llama_model * model = llama_get_model(ctx_tgt);
++    return llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
++}
++
+ struct common_speculative_impl {
+     const common_speculative_type type;
+ 
+@@ -222,6 +243,9 @@ struct common_speculative_impl {
+     // (checkpoint-restore path); accept() will not be called for that round
+     virtual void accept_partial(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) {}
+ 
++    // optional: the draft this implementation made for `seq_id` was cut to `n` tokens after draft() returned
++    virtual void truncated(llama_seq_id /*seq_id*/, int32_t /*n*/) {}
++
+     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
+     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
+     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+@@ -1061,12 +1085,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         int32_t              n_last = 0;     // length of the last draft, 0 once its acceptance was fed back
+         int32_t              step   = 0;     // drafts so far (every 4th drafts one token past w)
+         llama_token          extra  = -1;    // draft token w+1 of the last draft
++        int32_t              extra_k = 0;    // its position (w, or the aligned width)
+         bool                 full   = false; // the last draft was accepted in full: the next id_last decides extra
+         int32_t              pos    = 0;     // position of the sequence's last draft (the context length the cost sees)
+         std::vector<float>   h;              // running P(accepted | previous position accepted), per position
+         std::vector<int32_t> hist;           // verifications per width over the request
+     };
+     bool                      adapt      = false;
++    bool                      align      = false; // common_speculative_align_wanted
+     int                       adapt_log  = 0;
+     // one more verified position, as a fraction of a verification step (LLAMA_DFLASH_ADAPTIVE_COST; measured on gfx1201:
+     // about 0.035 below 5 rows)
+@@ -1146,6 +1172,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             const char * la = getenv("GGML_LF_ALL");          // GGML_LF_ALL=0: off unless set
+             adapt_log = ad != nullptr ? atoi(ad) : (la != nullptr && la[0] == '0' && la[1] == '\0' ? 0 : 1);
+             adapt     = is_dflash2 && adapt_log > 0;
++            align     = common_speculative_align_wanted(this->params.ctx_tgt);
+             const char * ac = getenv("LLAMA_DFLASH_ADAPTIVE_COST");
+             if (ac != nullptr && atof(ac) > 0.0) {
+                 adapt_cost = (float) atof(ac);
+@@ -1504,6 +1531,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         // can be checked against the target; the blocks of one batch have one length (the selector reads equal blocks),
+         // the longest asked for
+         int32_t n_draft = params.n_max;
++        // several sequences drafted together verify in one batch: they all send the widest width among them, and at
++        // least the length of a draft another drafter already made for the batch (an n-gram draft of a copying
++        // sequence, which is then cut to this length), since a batch whose sequences differ in length is split into
++        // ubatches on a hybrid target (common_speculative_align_wanted)
++        int32_t w_align = 0;
++        if (adapt && align) {
++            int32_t n_together = 0;
++            int32_t n_other    = 0;
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (dparams[seq_id].drafting) {
++                    n_together++;
++                    w_align = std::max(w_align, adapt_st[seq_id].w);
++                    n_other = std::max(n_other, dparams[seq_id].n_align);
++                }
++            }
++            w_align = n_together > 1 ? w_align : 0;
++            w_align = std::max(w_align, std::min(params.n_max, n_other));
++        }
+         if (adapt) {
+             n_draft = 1;
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -1514,6 +1559,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 const bool probe = st.step++ % 4 == 0;
+                 n_draft = std::max(n_draft, std::min(params.n_max, st.w + (probe ? 1 : 0)));
+             }
++            n_draft = std::max(n_draft, w_align);
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -1528,7 +1574,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 auto & st = adapt_st[seq_id];
+                 if (st.full && st.extra >= 0) {
+                     // the target's token after a draft accepted in full decides draft token w+1
+-                    adapt_observe(st, st.w, dp.id_last == st.extra);
++                    adapt_observe(st, st.extra_k, dp.id_last == st.extra);
+                 }
+                 st.full  = false;
+                 st.extra = -1;
+@@ -1649,11 +1695,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+                 if (adapt) {
+                     auto & st = adapt_st[seq_id];
+-                    if ((int32_t) result.size() > st.w) {
+-                        st.extra = result[st.w];
+-                        result.resize(st.w);
++                    const int32_t w = std::max(st.w, w_align);
++                    if ((int32_t) result.size() > w) {
++                        st.extra   = result[w];
++                        st.extra_k = w;
++                        result.resize(w);
+                         if (sample) {
+-                            dp.result_q->resize(st.w);
++                            dp.result_q->resize(w);
+                         }
+                     }
+                     st.n_last = (int32_t) result.size();
+@@ -1813,6 +1861,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             adapt_feedback(seq_id, n_accepted);
+         }
+     }
++
++    // the verified draft is shorter than the one recorded: the positions past n were not verified, and the probe token
++    // no longer follows the last verified one
++    void truncated(llama_seq_id seq_id, int32_t n) override {
++        if (adapt && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
++            auto & st = adapt_st[seq_id];
++            st.n_last = std::min(st.n_last, n);
++            st.extra  = -1;
++        }
++    }
+ };
+ 
+ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2889,6 +2947,9 @@ struct common_speculative {
+     std::vector<size_t>       shadow_len;
+     std::vector<llama_token>  shadow_last;
+     std::vector<int32_t>      shadow_run;
++
++    // common_speculative_align_wanted: the drafts of one call are cut to one length
++    bool align = false;
+ };
+ 
+ static common_ngram_map get_common_ngram_map(
+@@ -3532,6 +3593,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+         /* .shadow_len  = */ {},
+         /* .shadow_last = */ {},
+         /* .shadow_run  = */ {},
++        /* .align       = */ common_speculative_align_wanted(params.draft.ctx_tgt),
+     });
+ 
+     const int32_t n_max_configured = common_speculative_n_max(&params);
+@@ -3705,6 +3767,13 @@ void common_speculative_draft(common_speculative * spec) {
+         }
+     }
+ 
++    std::vector<llama_seq_id> asked;
++    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
++        if (dparams[seq_id].drafting) {
++            asked.push_back(seq_id);
++        }
++    }
++
+     {
+         int n_drafting = 0;
+ 
+@@ -3722,6 +3791,17 @@ void common_speculative_draft(common_speculative * spec) {
+     }
+ 
+     for (auto & impl : spec->impls) {
++        if (spec->align) {
++            // the drafts made so far in this call (a copying sequence's n-gram draft) set the length the next drafter
++            // aims for
++            int32_t n_ready = 0;
++            for (const llama_seq_id seq_id : asked) {
++                n_ready = std::max(n_ready, (int32_t) dparams[seq_id].result->size());
++            }
++            for (const llama_seq_id seq_id : asked) {
++                dparams[seq_id].n_align = dparams[seq_id].drafting ? n_ready : 0;
++            }
++        }
+         {
+             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+             impl->draft(dparams);
+@@ -3799,6 +3879,36 @@ void common_speculative_draft(common_speculative * spec) {
+             dp.drafting = false;
+         }
+     }
++
++    // one verify length for the sequences drafted together (common_speculative_align_wanted): DFlash2 already sends its
++    // widest width to all, so what is left is a copying sequence's n-gram draft next to model drafts, cut to the shortest
++    if (spec->align && asked.size() > 1) {
++        size_t n_lo = SIZE_MAX;
++        size_t n_hi = 0;
++        int    n_drafts = 0;
++        for (const llama_seq_id seq_id : asked) {
++            const size_t n = dparams[seq_id].result->size();
++            if (n > 0) {
++                n_lo = std::min(n_lo, n);
++                n_hi = std::max(n_hi, n);
++                n_drafts++;
++            }
++        }
++        if (n_drafts > 1 && n_lo < n_hi) {
++            for (const llama_seq_id seq_id : asked) {
++                auto & dp = dparams[seq_id];
++                if (dp.result->size() > n_lo) {
++                    dp.result->resize(n_lo);
++                    if (dp.result_q && !dp.result_q->empty()) {
++                        dp.result_q->resize(n_lo);
++                    }
++                    if (spec->impl_last[seq_id]) {
++                        spec->impl_last[seq_id]->truncated(seq_id, (int32_t) n_lo);
++                    }
++                }
++            }
++        }
++    }
+ }
+ 
+ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+diff --git a/common/speculative.h b/common/speculative.h
+index 358ff49ce..875988227 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -79,6 +79,10 @@ struct common_speculative_draft_params {
+     // the target's temp and seed, read only when the drafter samples probabilistically
+     float    temp = 1.0f;
+     uint32_t seed = LLAMA_DEFAULT_SEED;
++
++    // set by common_speculative_draft (LLAMA_SPEC_ALIGN): the longest draft another sequence already has for the same
++    // verify batch; a drafter that chooses its own length drafts at least this many tokens when it can
++    int32_t n_align = 0;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+-- 
+2.43.0
+

@@ -24,6 +24,9 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE` | off | speed/<br>lossy |
 | `0008-605-windows-moe-cache-close-v1` | Windows build of r143+ | — | on | fix |
 | `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT` | on | speed/<br>diff |
+| `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE` | on | speed |
+| `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW` | on (with `ngram-mod`) | speed/<br>diff |
+| `0015-605-spec-align-v1` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN` | on | speed |
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
