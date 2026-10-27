@@ -21,7 +21,7 @@ $k = Get-ChildItem (Split-Path $root) -Recurse -Directory -Filter gfx1201 | Wher
 Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201, next to llama-server.exe
 ```
 
-- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0007 needs 0004; the others stand alone).  The
+- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0007 needs 0004; 0009 needs 0002; the others stand alone).  The
   patches add `.cu` files: after applying, always run the configure step again.
 - **`0008` is needed on Windows**: r143 and later do not compile there without it (`close` undeclared in
   `moe-expert-cache.cu`, rdna-boosts issue #231).  It changes nothing on Linux; once rdna-boosts has the fix, skip it.
@@ -51,7 +51,7 @@ Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201,
 
 1. **clone 之前**先設 `git config --global core.autocrlf false`，patch 需要 LF 換行。
 2. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `6050b467c`；clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v15-6050b467c-r144`，用 Git for Windows 的 `bash` 在 llama.cpp 目錄執行 `apply-all.sh .`。舊版：`v12-097cf33d9-r51`～`r59` 用 `patches/r59/`（checkout `097cf33d9`），`v16-097cf33d9-r50` 用 `patches/r50/`，`v16-a55e952b8-rN` 用 `patches/a55/`（checkout `a55e952b8`）；這些舊版不設就是關。
-3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0007 需要 0004；其餘可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
+3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0007 需要 0004；0009 需要 0002；其餘可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
 4. **Windows 一定要套 `0008`**：r143 起少了它在 Windows 上編不過（`moe-expert-cache.cu` 的 `close` 未宣告，rdna-boosts issue #231）。它對 Linux 沒有影響；等 rdna-boosts 修好就不用套。
 5. cmake 用 Ninja，`-DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON`，編譯器與 `CMAKE_PREFIX_PATH` 指向 ROCm SDK（見上方指令）。不要加 `-DGGML_HIP_RCCL=1`：它只在多卡時有作用，而 Windows SDK 可能沒有 RCCL（設定步驟會失敗）。
 6. **`GGML_HIP_NO_VMM` 一定要保持 ON**：設成 OFF 時，長上下文會溢出到共用 GPU 記憶體，prefill 掉到約四分之一。`GGML_HIP_LF_HIPBLASLT` 保持預設 ON。

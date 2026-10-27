@@ -2,8 +2,8 @@
 
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
 for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, a faster decode / draft-verification
-matmul, a guard against replies that end inside the reasoning, an opt-in lenience for sampled drafts, and fixes of upstream
-llama.cpp code that we keep here.
+matmul, a guard against replies that end inside the reasoning, an opt-in lenience for sampled drafts, faster wide draft
+verification, and fixes of upstream llama.cpp code that we keep here.
 Other bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
@@ -23,6 +23,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0006-605-mmvk-v3` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK` | on | speed/<br>diff |
 | `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE` | off | speed/<br>lossy |
 | `0008-605-windows-moe-cache-close-v1` | Windows build of r143+ | — | on | fix |
+| `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT` | on | speed/<br>diff |
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
@@ -43,6 +44,10 @@ patch code is the same since); KLD measured again on r144 ([2026-10-27 report](r
 K1, F8 and M4 leave decode unchanged; `0006` changes decode only (for its KLD the decode path runs it at one token, `GGML_CUDA_MMVK=4`).  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
 2-3% for Chinese text and 0.1-0.3% for English; generation reads the prompt through the KV cache and sees far less (the KLD column).
 For prompt-scoring workloads set `GGML_LF_KQ_BLAS=f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
+
+`0009` changes only draft-verification batches of 9-16 rows (two slots verifying at once, or a long n-gram draft), which
+neither the KLD run nor the standard benchmark has; each of those rows then gets the result a batch of 8 rows or fewer gives.
+Two slots decoding at once at 50K each: 13-19% slower than one after the other without it, 33-38% faster with it.
 
 ## Switches
 

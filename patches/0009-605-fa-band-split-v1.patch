@@ -1,0 +1,170 @@
+From 72fd8ef7981f722920ac59b5c29242a4bb140238 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:28:05 +0800
+Subject: [PATCH] ggml-cuda: RDNA4 verify batches of 9..16 query rows run as
+ two halves through the decode/verify band
+
+A verify batch wider than 8 rows (two slots of a unified KV cache verifying the same width in one ubatch, or an n-gram
+draft longer than 7) fell off the band onto the generic WMMA config, which for GQA 6 re-reads every K/V element three
+times: at 110K cells a 12-row batch cost 107 ms against 53 ms for 8 rows (Qwen3.8-27B, the attention part about five
+times the band's).  The rows of an attention op are independent, so such a batch now runs as two halves of at most 8
+rows, each through the band: every row gets the band's result, as in a batch of <= 8 rows.  The two slots' ubatch holds
+one sequence after the other, so the halves are the two sequences and each half skips the other slot's cells.
+
+Only RDNA4 with the band's conditions on both halves and no node scratch, and only from GGML_CUDA_FA_BAND_SPLIT_MIN_KV
+cells (default 8192; 0 = any length): below that the two band launches cost more than the one generic launch they
+replace (per verify step of 12 / 16 rows and two 6 / 8-row sequences, +0.4..2.5 % at 1K..4K cells, against
+-1.9..-2.5 % at 8K and -30..-34 % at 110K; gfx1201, Qwen3.8-27B UD-Q4_K_XL).  On unless GGML_CUDA_FA_BAND_SPLIT=0;
+unset, GGML_LF_ALL=0 turns it off.
+
+test-backend-ops: the qwen35 band shape at 9 / 12 / 16 rows (f16 / bf16 / q8_0, kv 512 / 4096 / 16384, packed mask,
+packed mask with a masked block, derived mask): 108/108 with the split on and off.  Kernel trace, q8_0, kv 16384, 12
+rows: two band launches 376 us against one generic launch 595 us.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn.cu | 99 +++++++++++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp  | 15 ++++++
+ 2 files changed, 114 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 855dd929b..995d11b7e 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -901,8 +901,107 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     return f16_extra.end - (uintptr_t) dst->data;
+ }
+ 
++// RDNA4 verify batches of 9..16 query rows (an n-gram draft longer than 7, or two slots of a unified KV cache verifying
++// the same width in one ubatch) fall off the decode/verify band onto the generic WMMA config, which for GQA 6 re-reads
++// every K/V element three times: at 110K cells such a batch spends about five times the band's attention time.  The
++// rows of an attention op are independent, so the batch is run as two halves of at most 8 rows, each through the band:
++// every row then gets the band's result, the same as in a batch of <= 8 rows.  The ubatch of two slots that verify the
++// same width holds one sequence after the other, so the halves are the two sequences and each half also skips the
++// other slot's cells (GGML_CUDA_FA_BAND_SKIP).  GGML_CUDA_FA_BAND_SPLIT=0 turns it off (unset with GGML_LF_ALL=0: off).  Below
++// GGML_CUDA_FA_BAND_SPLIT_MIN_KV cells (default 8192) the two band launches cost more than the one generic launch saves
++// (gfx1201, Qwen3.8-27B, 12..16 rows: +0.4..2.5 % per step at 1K..4K cells, -2 % at 8K, -30 % at 110K).
++static bool ggml_cuda_fattn_band_split_enabled() {
++    static const bool enabled = []() {
++        const char * e = getenv("GGML_CUDA_FA_BAND_SPLIT");
++        if (e != nullptr) {
++            return atoi(e) != 0;
++        }
++        const char * a = getenv("GGML_LF_ALL");
++        return !(a != nullptr && a[0] == '0' && a[1] == '\0');
++    }();
++    return enabled;
++}
++
++static int64_t ggml_cuda_fattn_band_split_min_kv() {
++    static const int64_t v = []() {
++        const char * e = getenv("GGML_CUDA_FA_BAND_SPLIT_MIN_KV");
++        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 8192;
++    }();
++    return v;
++}
++
++static bool ggml_cuda_flash_attn_ext_band_split(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const int64_t n_q = Q->ne[1];
++    if (n_q <= 8 || n_q > 16 || Q->ne[3] != 1 || dst->ne[3] != 1 || !ggml_cuda_fattn_band_split_enabled() ||
++            dst->src[1]->ne[1] < ggml_cuda_fattn_band_split_min_kv()) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
++        return false;
++    }
++    // a half's dst is a row range of this node's allocation: there must be no scratch behind it
++    if (ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, dst) != ggml_nbytes(dst)) {
++        return false;
++    }
++
++    const ggml_tensor * mask   = dst->src[3];
++    const ggml_tensor * tok_lo = dst->src[6];
++    const ggml_tensor * tok_hi = dst->src[7];
++
++    // shallow copies with the row range of each half: Q and the mask rows (dim 1), dst rows (dim 2), the derived
++    // mask's per-token window (dim 0); K, V, sinks and the cell positions are shared
++    ggml_tensor q_h[2], mask_h[2], lo_h[2], hi_h[2], dst_h[2];
++    const int64_t n_0 = (n_q + 1)/2;
++    for (int h = 0; h < 2; ++h) {
++        const int64_t r0 = h == 0 ? 0 : n_0;
++        const int64_t nr = h == 0 ? n_0 : n_q - n_0;
++
++        q_h[h] = *Q;
++        q_h[h].ne[1] = nr;
++        q_h[h].data  = (char *) Q->data + r0*Q->nb[1];
++
++        dst_h[h] = *dst;
++        dst_h[h].ne[2]  = nr;
++        dst_h[h].data   = (char *) dst->data + r0*dst->nb[2];
++        dst_h[h].src[0] = &q_h[h];
++        if (mask) {
++            GGML_ASSERT(mask->ne[1] >= n_q);
++            mask_h[h] = *mask;
++            mask_h[h].ne[1] = nr;
++            mask_h[h].data  = (char *) mask->data + r0*mask->nb[1];
++            dst_h[h].src[3] = &mask_h[h];
++        }
++        if (tok_lo && tok_hi) {
++            GGML_ASSERT(tok_lo->ne[0] == n_q && tok_hi->ne[0] == n_q && tok_lo->ne[1] == 1 && tok_hi->ne[1] == 1);
++            lo_h[h] = *tok_lo;
++            lo_h[h].ne[0] = nr;
++            lo_h[h].data  = (char *) tok_lo->data + r0*tok_lo->nb[0];
++            hi_h[h] = *tok_hi;
++            hi_h[h].ne[0] = nr;
++            hi_h[h].data  = (char *) tok_hi->data + r0*tok_hi->nb[0];
++            dst_h[h].src[6] = &lo_h[h];
++            dst_h[h].src[7] = &hi_h[h];
++        }
++
++        if (ggml_cuda_get_best_fattn_kernel(ctx.device, &dst_h[h]) != BEST_FATTN_KERNEL_MMA_F16 ||
++                !ggml_cuda_fattn_band_wmma_applies(cc, &dst_h[h])) {
++            return false;
++        }
++    }
++
++    for (int h = 0; h < 2; ++h) {
++        ggml_cuda_flash_attn_ext(ctx, &dst_h[h]);
++    }
++    return true;
++}
++
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    if (ggml_cuda_flash_attn_ext_band_split(ctx, dst)) {
++        return;
++    }
+     // Llama-Frankenstein: FP8 prefill attention (GGML_LF_FA_FP8=1, off by default; see lf-fa-fp8.cuh)
+     if (ggml_cuda_lf_fa_fp8_supported(ctx, dst)) {
+         ggml_cuda_lf_fa_fp8(ctx, dst);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 10cdf81cc..02099d65a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12762,6 +12762,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // The same shape at the 9..16-row verify widths, which the RDNA4 band runs as two halves of <= 8 rows
++    // (GGML_CUDA_FA_BAND_SPLIT): the packed mask, the packed mask with a fully masked interior block (another slot's
++    // cells, so the band skip engages inside each half), and the derived form a single-sequence batch of more than
++    // 8 tokens carries.
++    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
++        for (int kv : { 512, 4096, 16384 }) {
++            for (int nb : { 9, 12, 16 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type, type));
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}));
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 0, false, false, true));
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, false, false, 0, 0, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 0, true, kv > 1280));
++            }
++        }
++    }
++
+     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+-- 
+2.43.0
+

@@ -14,7 +14,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS=gfx12
 cmake --build build --target llama-server -j
 ```
 
-- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0007 needs 0004; the others stand alone).  The
+- Apply in number order (0003 needs 0001; 0006 needs 0001 and 0003; 0007 needs 0004; 0009 needs 0002; the others stand alone).  The
   patches add `.cu` files: after applying, always run the configure step again.
 - Older releases: `v12-097cf33d9-r51` to `r59` use `patches/r59/` (check out `097cf33d9`), `v16-097cf33d9-r50` uses
   `patches/r50/`, a `v16-a55e952b8-rN` release uses `patches/a55/` (check out `a55e952b8`).  Those sets are off unless set.
@@ -37,7 +37,7 @@ cmake --build build --target llama-server -j
 
 1. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `6050b467c`。
 2. clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v15-6050b467c-r144`，在 llama.cpp 目錄裡執行它的 `scripts/apply-all.sh .`。舊版：`v12-097cf33d9-r51`～`r59` 用 `patches/r59/`（checkout `097cf33d9`），`v16-097cf33d9-r50` 用 `patches/r50/`，`v16-a55e952b8-rN` 用 `patches/a55/`（checkout `a55e952b8`）；這些舊版不設就是關。
-3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0007 需要 0004；其餘可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
+3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0007 需要 0004；0009 需要 0002；其餘可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
 4. cmake：`-DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON`，`GGML_HIP_LF_HIPBLASLT` 保持預設 ON；其他參數照 rdna-boosts README（`-DGGML_HIP_RCCL=1` 只在多卡時有作用）。找不到 HIP 編譯器時加 `-DCMAKE_HIP_COMPILER=<rocm>/lib/llvm/bin/clang++`。
 5. hipBLASLt 會從 `libhipblaslt.so` 旁邊的 `hipblaslt/library` 載入 kernel（TheRock 在 `hipblaslt/library/gfx1201/`），只要載入的是那個 ROCm `lib` 資料夾就不必複製（pip／TheRock 安裝要把它放進 `LD_LIBRARY_PATH`）。log 出現 `hipBLASLt has no ... kernels` 時，把 `HIPBLASLT_TENSILE_LIBPATH` 設成那個 `gfx1201` 資料夾。
 6. 編 `llama-server`，用 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0` 啟動。patch 預設都是開的（開關見 [SWITCHES.md](SWITCHES.md)）；log 要出現 `GGML_LF_KQ_BLAS: fp8 prefill GEMM through hipBLASLt on`。
