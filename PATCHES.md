@@ -6,7 +6,7 @@ the [README](README.md#patches).  Written with Claude (AI).
 | patch | what | switch (default) | type | needs |
 |---|---|---|---|---|
 | `0001-605-k1-v4` | prefill matmuls of K-quant weights through hipBLASLt in fp8 (or f16); fp8 corrects the largest activation channels.  v4 = v3.3, on by default | `GGML_LF_KQ_BLAS` (`fp8` when every GPU is a gfx1201; `0` = off); `GGML_LF_DRAFT_UB` (`512`) shrinks the draft model's ubatch | speed/lossy | hipBLASLt |
-| `0002-605-f8-v4` | prefill flash attention in fp8 (and no growing F16 staging copy).  v4 = v3.3, on by default | `GGML_LF_FA_FP8` (on; `0` = off) | speed/lossy | — |
+| `0002-605-f8-v5` | prefill flash attention in fp8 (and no growing F16 staging copy).  v5 = v4 with the row sum counted from the fp8 probabilities (numerator and denominator from the same numbers); v4 = v3.3, on by default | `GGML_LF_FA_FP8` (on; `0` = off) | speed/lossy | — |
 | `0003-605-m4-v3` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM.  v3 = v2, on by default | `GGML_LF_MXFP4_DIRECT` (`blaslt`; `0` = off) | speed/lossy | 0001 |
 | `0004-605-reasoning-guard-v2` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts).  v2 = v1, on by default | `LLAMA_REASONING_GUARD` (on; `0` = off) | guard | — |
 | `0005-605-backend-sampling-reserve-v1` | with `--backend-sampling`, the compute buffers are reserved once per sequence instead of being freed and allocated again for every request (upstream llama.cpp behavior; about 0.25 s per request on a 27B model at `-ub 2048`) | always on | fix | — |
@@ -18,6 +18,16 @@ the [README](README.md#patches).  Written with Claude (AI).
 Type: `speed/lossy` = faster, with error above the run-to-run floor (or, for 0007, a bounded change of the output distribution); `speed/diff` = faster, output not bit-identical to the stock code but within the floor; `guard` = changes behavior only in a failure case; `fix` = a bug fix; `speed/trade-off` = faster on some workloads and slower on others, so off unless you ask for it.
 
 ## Change log
+
+**2026-10-27 (evening):** `0002` F8 v5 (replaces v4).  F8 added the fp32 probabilities into the row sum but multiplied V by
+their fp8 conversions; a probability below the smallest fp8 subnormal (about 2^-18 of the row's maximum) dropped out of
+the numerator while staying in the denominator, so the attention output came out slightly small, more so the longer the
+context.  v5 sums the fp8 values themselves (the principle of Barron et al., "A Fix for Softmax and Cross-Entropy",
+arXiv 2610.31642).  On a 170K-token reasoning conversation F8's own KLD drops from 0.000396 to 0.000307 (floor 0.00021);
+with all defaults the change is below the floor; prefill speed is unchanged.  v4 users: apply
+[`patches/increments/0002-605-f8-v4-to-v5.patch`](patches/increments/0002-605-f8-v4-to-v5.patch) (it touches only
+`lf-fa-fp8.cu`, which no other patch changes), or start again from a clean tree with the new set.  See the
+[report](reports/2026-10-27.md#0002-v5-the-row-sum-of-f8).
 
 **2026-10-27 (later):** a new set for rdna-boosts `v15-6050b467c-r144` (upstream base `6050b467c`); the r59 set moved to
 [`patches/r59/`](patches/r59).  **The patches are now on by default** (`0` turns one off, `GGML_LF_ALL=0` turns off every

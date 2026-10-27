@@ -1,7 +1,16 @@
-From bd95c50792ffa183420a029362b9e1d4a82df11a Mon Sep 17 00:00:00 2001
+From e836a79f96a721d21b095392e0ce90b5f676e850 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 05:40:20 +0800
-Subject: [PATCH] F8 v4: flash-attention prefill in fp8, on by default
+Subject: [PATCH] F8 v5: flash-attention prefill in fp8, on by default; the row
+ sum counts the probabilities as fp8
+
+v5: the row sum l added the fp32 probabilities while O = V^T P^T multiplied their fp8 conversions.  A probability below
+the smallest fp8 subnormal (about 2^-18 of the row's running max, after the 2^8 scale) became 0 in O but still counted
+in l, so the output came out systematically small, more so the longer the context.  l now sums the fp8 values
+themselves (converted back to fp32), so numerator and denominator use the same numbers (the principle of Barron et al.,
+"A Fix for Softmax and Cross-Entropy", arXiv 2610.31642).  Qwen3.8-27B Q5_K_M, a 170K-token reasoning conversation,
+F8 alone against plain r144: KLD 0.000396 -> 0.000307 (the one-bit floor is 0.00021); at 60K 0.000247 -> 0.000285, at
+the floor.  Prefill speed unchanged (R9700, 32K / 110K: +0.3 %).
 
 v4 = v3.3 with the switch on by default: GGML_LF_FA_FP8 unset means on (0 turns it off; GGML_LF_ALL=0 makes it default
 to off).  The 1 MiB cap of the F16 staging copy applies only where F8 runs (every device RDNA4), unless
@@ -17,9 +26,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  ggml/src/ggml-cuda/common.cuh    |  23 ++
  ggml/src/ggml-cuda/fattn.cu      |   6 +
- ggml/src/ggml-cuda/lf-fa-fp8.cu  | 620 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/lf-fa-fp8.cu  | 637 +++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/lf-fa-fp8.cuh |  12 +
- 4 files changed, 661 insertions(+)
+ 4 files changed, 678 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cu
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cuh
 
@@ -86,10 +95,10 @@ index e3a9707f3..855dd929b 100644
              GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cu b/ggml/src/ggml-cuda/lf-fa-fp8.cu
 new file mode 100644
-index 000000000..d85bd720f
+index 000000000..e6692ee4c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-fa-fp8.cu
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,637 @@
 +#include "lf-fa-fp8.cuh"
 +
 +#include <algorithm>
@@ -172,6 +181,22 @@ index 000000000..d85bd720f
 +#else
 +    GGML_UNUSED_VARS(v, inv);
 +    return make_uint2(0, 0);
++#endif // defined(RDNA4)
++}
++
++// the sum of the eight fp8 values lf_pack_fp8 wrote, in fp32: the row sum must count each probability as the fp8 P.V WMMA
++// sees it.  Summed from the fp32 values instead, a weight below the smallest fp8 subnormal (about 2^-18 of the row's
++// running max) counted in l but not in O, so the output came out systematically small, more so the longer the context.
++static __device__ __forceinline__ float lf_sum_fp8(const uint2 w) {
++#if defined(RDNA4)
++    const int a = (int) w.x, b = (int) w.y;
++    return ((__builtin_amdgcn_cvt_f32_fp8(a, 0) + __builtin_amdgcn_cvt_f32_fp8(a, 1)) +
++            (__builtin_amdgcn_cvt_f32_fp8(a, 2) + __builtin_amdgcn_cvt_f32_fp8(a, 3))) +
++           ((__builtin_amdgcn_cvt_f32_fp8(b, 0) + __builtin_amdgcn_cvt_f32_fp8(b, 1)) +
++            (__builtin_amdgcn_cvt_f32_fp8(b, 2) + __builtin_amdgcn_cvt_f32_fp8(b, 3)));
++#else
++    GGML_UNUSED(w);
++    return 0.f;
 +#endif // defined(RDNA4)
 +}
 +
@@ -479,8 +504,9 @@ index 000000000..d85bd720f
 +        for (int ks_ = 0; ks_ < LF_KT / 16; ++ks_) {
 +            float p[8];
 +#pragma unroll
-+            for (int v = 0; v < 8; ++v) { p[v] = __builtin_amdgcn_exp2f(fmaf(s[ks_][v], cc, -msub)); ls += p[v]; }
++            for (int v = 0; v < 8; ++v) p[v] = __builtin_amdgcn_exp2f(fmaf(s[ks_][v], cc, -msub));
 +            const uint2 w = lf_pack_fp8(p, 1.f);
++            ls += lf_sum_fp8(w);
 +            p8[ks_] = lf_v2i{(int) w.x, (int) w.y};
 +        }
 +        l = l * alpha + ls;

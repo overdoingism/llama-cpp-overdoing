@@ -16,7 +16,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | patch | what | switch | default | type |
 |---|---|---|---|---|
 | `0001-605-k1-v4` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS` | on (fp8) | speed/<br>lossy |
-| `0002-605-f8-v4` | fp8 prefill attention | `GGML_LF_FA_FP8` | on | speed/<br>lossy |
+| `0002-605-f8-v5` | fp8 prefill attention | `GGML_LF_FA_FP8` | on | speed/<br>lossy |
 | `0003-605-m4-v3` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT` | on | speed/<br>lossy |
 | `0004-605-reasoning-guard-v2` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD` | on | guard |
 | `0005-605-backend-sampling-reserve-v1` | no buffer reallocation per request | — | on | fix |
@@ -36,14 +36,18 @@ patch code is the same since); KLD measured again on r144 ([2026-10-27 report](r
 | reference (no patch) | — | 0.0018 / 0.0006 (run-to-run floor) |
 | K1 f16 | +14% / +15% | 0.0018 / 0.0005 (≈ floor) |
 | K1 fp8 (the default) | +16% / +22% on top of f16 | 0.0026 / 0.0007 |
-| F8 | +3% / +17% | 0.0019 / 0.0007 |
+| F8 (v4; v5 below) | +3% / +17% | 0.0019 / 0.0007 |
 | M4 (MXFP4 models only) | +55% at 8K, +44% at 110K | +0.002 / +0.0006 over the MXFP4 weights themselves |
 | mmvk (`0006`) | — (decode: 4.5-6% less time per step with drafts) | 0.0015 / 0.0003 (below the floor) |
-| **all defaults** | | **0.0024 / 0.0008** |
+| **all defaults** (with F8 v4) | | **0.0024 / 0.0008** |
 
 K1, F8 and M4 leave decode unchanged; `0006` changes decode only (for its KLD the decode path runs it at one token, `GGML_CUDA_MMVK=4`).  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
 2-3% for Chinese text and 0.1-0.3% for English; generation reads the prompt through the KV cache and sees far less (the KLD column).
 For prompt-scoring workloads set `GGML_LF_KQ_BLAS=f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
+
+F8 v5 counts the row sum from the fp8 probabilities themselves: on a 170K-token reasoning conversation F8's own KLD drops by
+a fifth (0.000396 to 0.000307, floor 0.00021); with all defaults the change is below the floor, at the same prefill speed
+([report](reports/2026-10-27.md#0002-v5-the-row-sum-of-f8)).
 
 `0009` changes only draft-verification batches of 9-16 rows (two slots verifying at once, or a long n-gram draft), which
 neither the KLD run nor the standard benchmark has; each of those rows then gets the result a batch of 8 rows or fewer gives.
