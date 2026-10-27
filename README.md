@@ -13,20 +13,20 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 `v15-6050b467c-r144` (upstream base `6050b467c`).  Older sets: `patches/r59/` for `v12-097cf33d9-r51` to `r59`, `patches/r50/` for
 `v16-097cf33d9-r50`, `patches/a55/` for `v16-a55e952b8-rN`.
 
-| patch | what | switch | default | type |
-|---|---|---|---|---|
-| `0001-605-k1-v4` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS` | on (fp8) | speed/<br>lossy |
-| `0002-605-f8-v5` | fp8 prefill attention | `GGML_LF_FA_FP8` | on | speed/<br>lossy |
-| `0003-605-m4-v3` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT` | on | speed/<br>lossy |
-| `0004-605-reasoning-guard-v2` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD` | on | guard |
-| `0005-605-backend-sampling-reserve-v1` | no buffer reallocation per request | — | on | fix |
-| `0006-605-mmvk-v3` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK` | on | speed/<br>diff |
-| `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE` | off | speed/<br>lossy |
-| `0008-605-windows-moe-cache-close-v1` | Windows build of r143+ | — | on | fix |
-| `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT` | on | speed/<br>diff |
-| `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE` | on | speed |
-| `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW` | on (with `ngram-mod`) | speed/<br>diff |
-| `0015-605-spec-align-v1` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN` | on | speed |
+| patch | what | switch | type |
+|---|---|---|---|
+| `0001-605-k1-v4` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS`<br>(default on, fp8) | speed/<br>lossy |
+| `0002-605-f8-v5` | fp8 prefill attention | `GGML_LF_FA_FP8`<br>(default on) | speed/<br>lossy |
+| `0003-605-m4-v3` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT`<br>(default on) | speed/<br>lossy |
+| `0004-605-reasoning-guard-v2` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD`<br>(default on) | guard |
+| `0005-605-backend-sampling-reserve-v1` | no buffer reallocation per request | —<br>(always on) | fix |
+| `0006-605-mmvk-v3` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK`<br>(default on) | speed/<br>diff |
+| `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE`<br>(default off) | speed/<br>lossy |
+| `0008-605-windows-moe-cache-close-v1` | Windows build of r143-r146 | —<br>(always on) | fix |
+| `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | speed/<br>diff |
+| `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
+| `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
+| `0015-605-spec-align-v1` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`<br>(default on) | speed |
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
@@ -60,11 +60,21 @@ Two slots decoding at once at 50K each: 13-19% slower than one after the other w
 
 Every switch, its values, and the server parameters it needs: [SWITCHES.md](SWITCHES.md).
 
+On Linux we also set ROCm's own `HSA_USERPTR_FOR_PAGED_MEM=0`.  By default ROCm allocates pinned host memory
+(`hipHostMalloc`, llama.cpp's `ROCm_Host` buffers) as ordinary pageable pages registered with the GPU; when the kernel swaps out
+or moves one of them (memory pressure, compaction), the driver stops all GPU queues of the process until the page is
+back (5-440 ms at a time, often several in a row).  With `0` those buffers are allocated by the driver instead and cannot be
+swapped or moved.  Under the same memory pressure: 23 stalls (1.16 s in total over 19 requests) became none, with the
+same output and speed ([report](reports/2026-10-27.md#linux-gpu-stalls-under-memory-pressure)).  The cost: those
+buffers (about 0.7 GB with every layer on the GPU) stay in RAM; with large weights left in host memory (partial offload
+without mmap) they count against the driver's limit.  Not needed on Windows.
+
 ## Applicable versions
 
 Tested on rdna-boosts `v15-6050b467c-r144`: the patches in `patches/` apply in number order on the plain release, build, and
-give the History numbers.  On another release, check with `git apply --check` first.  A release on a new upstream base (not
-`6050b467c`) needs a new patch set.
+give the History numbers.  On `v15-6050b467c-r152` (2026-10-27) they apply too (`git am`, not built or measured there),
+except `0008`: rdna-boosts has the same fix since r147, so leave `0008` out from r147 on.  On another release, check with
+`git apply --check` first.  A release on a new upstream base (not `6050b467c`) needs a new patch set.
 
 ## History
 
