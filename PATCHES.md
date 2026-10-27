@@ -22,7 +22,9 @@ Type: `speed/lossy` = faster, with error above the run-to-run floor (or, for 000
 
 ## Change log
 
-**2026-10-27 (late night), `0007`:** with `LLAMA_SPEC_LENIENCE=0.8663` on a Windows build that also has `0012` and `0014` (and `--spec-type ngram-mod,draft-dflash`), a long sampled request (temperature 1) ran at about three times the usual speed from the start and gave no usable output. Until this is understood, leave `LLAMA_SPEC_LENIENCE` unset (the default) and do not send `spec_lenience`. Without it the same build runs normally.
+**2026-10-28, `0007`:** the known-problem note of 2026-10-27 is withdrawn.  The broken request came from an undervolted
+card (−35 mV and −5 % power limit): at stock settings the same requests gave the same output every time, with or
+without `LLAMA_SPEC_LENIENCE`.  Nothing changes in the patches.
 
 **2026-10-27 (later), documents only:** the patches also apply on rdna-boosts `v15-6050b467c-r152` (not built or measured
 there), except `0008`, whose fix rdna-boosts has since r147.  New Linux note on ROCm's `HSA_USERPTR_FOR_PAGED_MEM=0`
