@@ -2,7 +2,7 @@
 
 Written with Claude (AI).  Every switch is an environment variable, read once when `llama-server` starts.  **The patches are
 on by default** (the default is under each variable): to turn one off, set it to `0`.  `GGML_LF_ALL=0` makes every switch you leave unset
-default to off; the build then behaves like plain rdna-boosts, apart from the two fixes (0005, 0008).  `0007` is the
+default to off; the build then behaves like plain rdna-boosts, apart from the fix 0005 (and 0008 where it applies).  `0007` is the
 exception: lossy, so off unless you ask for it.  Set the variables in the shell that starts the server (`NAME=value` before
 the command in bash, `$env:NAME = "value"` in PowerShell).
 
@@ -24,7 +24,8 @@ the command in bash, `$env:NAME = "value"` in PowerShell).
 | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | 0009 | `1`, `0` | RDNA4: a draft-verification batch of 9 to 16 query rows (two slots of a unified KV cache verifying at once, or an n-gram draft longer than 7) runs its attention as two halves of at most 8 rows through the decode / verify kernel instead of the generic one.  Each row gets the result a batch of 8 rows or fewer gives (not bit-identical to the generic kernel).  Only with `-fa on`, from `GGML_CUDA_FA_BAND_SPLIT_MIN_KV` KV cells (default `8192`; `0` = any length): below that the two launches cost more than they save. |
 | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | 0012 | `1`, `2`, `0` | DFlash2 drafts each sequence's own width (1 to `--spec-draft-n-max`) from running acceptance estimates; the output does not change.  `2` also logs the width changes and, per request, the verifications per width.  `0`: the fixed width.  `LLAMA_DFLASH_ADAPTIVE_COST` (`0.035`) and `LLAMA_DFLASH_ADAPTIVE_JUMP` (`0.08`) set the cost model. |
 | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default `24`) | 0014 | a number; `0` = off | Only with an n-gram type ahead of a model drafter (`--spec-type ngram-mod,draft-dflash`).  The n-gram drafts are held back until they have predicted this many of the model's tokens in a row; then they are verified (up to `--spec-ngram-mod-n-max`) without DFlash2, until one misses.  `0`: the n-gram drafts always go first, as upstream.  `LLAMA_SPEC_NGRAM_SHADOW_EXACT=1` cuts them to 7 tokens, so the greedy output is the one without the n-gram type. |
-| `LLAMA_SPEC_ALIGN`<br>(default on) | 0015 | `1`, `0` | Hybrid / recurrent models only: sequences that verify drafts in the same batch send drafts of one length (DFlash2's adaptive width aligns up to the others, up to `--spec-draft-n-max`; a longer draft is cut to the shortest), so the verify batch is not split into ubatches. |
+| `LLAMA_SPEC_ALIGN`<br>(default on) | 0015 | `1`, `0` | Hybrid / recurrent models only: sequences that verify drafts in the same batch send drafts of one length (DFlash2's adaptive width aligns up to the others, up to `--spec-draft-n-max`; a longer draft is cut to the shortest), so the verify batch is not split into ubatches.  From r154 rdna-boosts reads the same variable for its own alignment of `draft-mtp-adaptive`: `0` turns off both; with `GGML_LF_ALL=0` and the variable unset, ours is off and the release's stays on. |
+| `LLAMA_SPEC_ALIGN_CUT`<br>(default on) | 0015 v2 | `1`, `0` | The cut of the drafts of one call to the shortest one, and the raise of DFlash2's width to a draft another drafter already made, which it relies on.  `0`: unequal drafts are left to the ubatch split, as in the release (rdna-boosts measured the cut as a loss where an n-gram draft is short because of its content; here it removes a mismatch of two caps, a copying slot's 15-token n-gram draft next to DFlash2's block). |
 
 0001-0003 do not touch decode and draft verification: their batches are below every minimum above.  0006 and 0009 are only
 for them.  0007 changes only how sampled drafts are accepted; 0012, 0014 and 0015 only what is drafted.
@@ -75,7 +76,7 @@ turns on F8 alone).
 
 # 開關
 
-本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次。**patch 預設都是開的**（預設值寫在每個變數下方）：要關哪一個，就把它設成 `0`。`GGML_LF_ALL=0` 會讓所有沒設的開關預設改成關；這時行為和原版 rdna-boosts 相同，只差兩個修正（0005、0008）。`0007` 是例外：它有損，所以不設就是關。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）。
+本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次。**patch 預設都是開的**（預設值寫在每個變數下方）：要關哪一個，就把它設成 `0`。`GGML_LF_ALL=0` 會讓所有沒設的開關預設改成關；這時行為和原版 rdna-boosts 相同，只差修正 0005（以及適用版本上的 0008）。`0007` 是例外：它有損，所以不設就是關。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）。
 
 （`patches/r59/`、`patches/r50/`、`patches/a55/` 是舊版：那些版本不設就是關。）
 
@@ -95,7 +96,8 @@ turns on F8 alone).
 | `GGML_CUDA_FA_BAND_SPLIT`<br>（預設開） | 0009 | `1`、`0` | RDNA4：9～16 個查詢列的草稿驗證批次（unified KV 下兩個 slot 同時驗證，或 n-gram 草稿超過 7 個 token）把注意力切成兩半、每半最多 8 列，走 decode／驗證用的 kernel，而不是一般 kernel。每一列得到的結果和 8 列以下的批次相同（和一般 kernel 不逐位元相同）。只在 `-fa on`、KV 達 `GGML_CUDA_FA_BAND_SPLIT_MIN_KV` 格（預設 `8192`；`0` 為不限長度）時作用：更短時兩次發射的成本大於省下的。 |
 | `LLAMA_DFLASH_ADAPTIVE`<br>（預設開） | 0012 | `1`、`2`、`0` | DFlash2 依照持續更新的接受率估計，為每個序列各自選草稿寬度（1 到 `--spec-draft-n-max`）；輸出不變。`2` 另外記錄寬度變化，以及每個請求在各寬度的驗證次數。`0`：固定寬度。成本模型用 `LLAMA_DFLASH_ADAPTIVE_COST`（`0.035`）與 `LLAMA_DFLASH_ADAPTIVE_JUMP`（`0.08`）設定。 |
 | `LLAMA_SPEC_NGRAM_SHADOW`<br>（預設 `24`） | 0014 | 數字；`0` 為關 | 只在模型草稿器前面有 n-gram 類型時作用（`--spec-type ngram-mod,draft-dflash`）。n-gram 草稿先不送出，等它連續猜中模型這麼多個 token 之後，才不經 DFlash2 直接送驗證（最多 `--spec-ngram-mod-n-max` 個），直到猜錯一次為止。`0`：n-gram 草稿一律優先，和上游相同。`LLAMA_SPEC_NGRAM_SHADOW_EXACT=1` 把它截到 7 個 token，greedy 輸出就和沒有 n-gram 類型時相同。 |
-| `LLAMA_SPEC_ALIGN`<br>（預設開） | 0015 | `1`、`0` | 只對 hybrid／recurrent 模型：在同一批次裡驗證草稿的序列送出同樣長度的草稿（DFlash2 的自適應寬度往上對齊其他序列，最多到 `--spec-draft-n-max`；較長的草稿截到最短的長度），驗證批次就不會被拆成多個 ubatch。 |
+| `LLAMA_SPEC_ALIGN`<br>（預設開） | 0015 | `1`、`0` | 只對 hybrid／recurrent 模型：在同一批次裡驗證草稿的序列送出同樣長度的草稿（DFlash2 的自適應寬度往上對齊其他序列，最多到 `--spec-draft-n-max`；較長的草稿截到最短的長度），驗證批次就不會被拆成多個 ubatch。r154 起 rdna-boosts 也用同一個變數控制它自己對 `draft-mtp-adaptive` 的對齊：設 `0` 兩者都關；`GGML_LF_ALL=0` 且沒設這個變數時，我們的關、原版的照舊開。 |
+| `LLAMA_SPEC_ALIGN_CUT`<br>（預設開） | 0015 v2 | `1`、`0` | 把同一輪的草稿截到最短的長度，以及它所依賴的「DFlash2 寬度往上對齊其他草稿器已出的草稿」。`0`：長度不同的草稿交給 ubatch 拆分處理，和原版相同（rdna-boosts 量到：n-gram 草稿因內容而短時，截短是損失；這裡截掉的是兩個上限造成的不等長，照抄 slot 的 15 個 token n-gram 草稿對上 DFlash2 的區塊）。 |
 
 0001～0003 不影響 decode 與草稿驗證：它們的批次都低於上面的下限。0006 與 0009 只作用在這兩者。0007 只改變抽樣草稿的接受方式；0012、0014、0015 只改變草稿的內容。
 

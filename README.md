@@ -10,7 +10,8 @@ Patches only; MIT.  Written with Claude (AI).
 ## Patches
 
 File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `patches/` are for rdna-boosts
-`v15-6050b467c-r144` (upstream base `6050b467c`).  Older sets: `patches/r59/` for `v12-097cf33d9-r51` to `r59`, `patches/r50/` for
+`v15-6050b467c-r156` (upstream base `6050b467c`); `patches/r144/` has what r144 to r153 need besides them
+([Applicable versions](#applicable-versions)).  Older sets: `patches/r59/` for `v12-097cf33d9-r51` to `r59`, `patches/r50/` for
 `v16-097cf33d9-r50`, `patches/a55/` for `v16-a55e952b8-rN`.
 
 | patch | what | switch | type |
@@ -22,11 +23,12 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0005-605-backend-sampling-reserve-v1` | no buffer reallocation per request | —<br>(always on) | fix |
 | `0006-605-mmvk-v3` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK`<br>(default on) | speed/<br>diff |
 | `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE`<br>(default off) | speed/<br>lossy |
-| `0008-605-windows-moe-cache-close-v1` | Windows build of r143-r146 | —<br>(always on) | fix |
 | `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | speed/<br>diff |
 | `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
 | `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
-| `0015-605-spec-align-v1` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`<br>(default on) | speed |
+| `0015-605-spec-align-v2` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
+
+<sub>0010, 0011, 0013 (Temporarily)</sub>
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
@@ -72,10 +74,12 @@ without mmap) they count against the driver's limit.  Not needed on Windows.
 
 ## Applicable versions
 
-Tested on rdna-boosts `v15-6050b467c-r144`: the patches in `patches/` apply in number order on the plain release, build, and
-give the History numbers.  On `v15-6050b467c-r152` (2026-10-27) they apply too (`git am`, not built or measured there),
-except `0008`: rdna-boosts has the same fix since r147, so leave `0008` out from r147 on.  On another release, check with
-`git apply --check` first.  A release on a new upstream base (not `6050b467c`) needs a new patch set.
+Tested on rdna-boosts `v15-6050b467c-r156`: the patches in `patches/` apply in number order on the plain release, build, and
+give the History numbers.  `0015` v2 needs r154 or later (it shares the release's own `LLAMA_SPEC_ALIGN`).  For r144 to r153,
+apply the same files except `0015` (its `git apply --check` fails there), then `patches/r144/0015-605-spec-align-v1.patch`;
+on Windows, r143 to r146 also need `patches/r144/0008-605-windows-moe-cache-close-v1.patch` (rdna-boosts has its fix since r147).
+On another release, check with `git apply --check` first.  A release on a new upstream base (not `6050b467c`) needs a new
+patch set.
 
 ## History
 
@@ -94,8 +98,11 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 | [2026&#8209;10&#8209;18](reports/2026-10-18.md) | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2, mmvk&nbsp;v2 | **2207** | **53.8** | **2389** | **67.2** |
 | original | `v15-6050b467c-r144` | 1154 | 50.7 | 1381 | 63.5 |
 | [2026&#8209;10&#8209;27](reports/2026-10-27.md) | + K1&nbsp;v4, F8&nbsp;v4, M4&nbsp;v3, mmvk&nbsp;v3 (the defaults) | **2293** | **56.1** | **2449** | **65.4** |
+| original | `v15-6050b467c-r156` | 1155 | 52.8 | 1384 | 57.9 |
+| [2026&#8209;10&#8209;28](PATCHES.md#change-log) | + K1&nbsp;v4, F8&nbsp;v5, M4&nbsp;v3, mmvk&nbsp;v3 (the defaults) | **2300** | **58.8** | **2467** | **61.0** |
 
-Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
+Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.  From r144 to r156 the time per decode step did not change (MXFP4:
+43.35 / 43.21 ms with the patches); the decode figures moved with the draft acceptance, as the generated text changed.
 
 ## Build
 
