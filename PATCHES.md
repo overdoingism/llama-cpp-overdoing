@@ -22,6 +22,8 @@ Type: `speed/lossy` = faster, with error above the run-to-run floor (or, for 000
 
 ## Change log
 
+**2026-10-27 (late night), `0007`:** with `LLAMA_SPEC_LENIENCE=0.8663` on a Windows build that also has `0012` and `0014` (and `--spec-type ngram-mod,draft-dflash`), a long sampled request (temperature 1) ran at about three times the usual speed from the start and gave no usable output. Until this is understood, leave `LLAMA_SPEC_LENIENCE` unset (the default) and do not send `spec_lenience`. Without it the same build runs normally.
+
 **2026-10-27 (later), documents only:** the patches also apply on rdna-boosts `v15-6050b467c-r152` (not built or measured
 there), except `0008`, whose fix rdna-boosts has since r147.  New Linux note on ROCm's `HSA_USERPTR_FOR_PAGED_MEM=0`
 ([README](README.md#switches)).  Defaults are now shown under each switch; the Chinese half of SWITCHES.md lists every

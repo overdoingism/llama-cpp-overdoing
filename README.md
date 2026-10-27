@@ -30,6 +30,11 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
+**Known problem (2026-10-27, under investigation):** with `LLAMA_SPEC_LENIENCE=0.8663` on a Windows build that also
+has `0012` and `0014` (and `--spec-type ngram-mod,draft-dflash`), a long sampled request (temperature 1) ran at about
+three times the usual speed from the start and gave no usable output.  Until this is understood, leave
+`LLAMA_SPEC_LENIENCE` unset (the default) and do not send `spec_lenience`.  Without it the same build runs normally.
+
 All are on by default except `0007`; `GGML_LF_ALL=0` turns off every switch left unset ([SWITCHES.md](SWITCHES.md)).
 Prefill speed-ups measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt, on `v16-a55e952b8-r8` (the
 patch code is the same since); KLD measured again on r144 ([2026-10-27 report](reports/2026-10-27.md)):
