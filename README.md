@@ -17,7 +17,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 
 | patch | what | switch | type |
 |---|---|---|---|
-| `0001-605-k1-v4` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS`<br>(default on, fp8) | speed/<br>lossy |
+| `0001-605-k1-v6` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS`<br>(default on, fp8) | speed/<br>lossy |
 | `0002-605-f8-v5` | fp8 prefill attention | `GGML_LF_FA_FP8`<br>(default on) | speed/<br>lossy |
 | `0003-605-m4-v3` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT`<br>(default on) | speed/<br>lossy |
 | `0004-605-reasoning-guard-v2` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD`<br>(default on) | guard |

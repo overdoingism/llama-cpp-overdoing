@@ -12,7 +12,7 @@ the command in bash, `$env:NAME = "value"` in PowerShell).
 
 | variable | patch | values | what it does |
 |---|---|---|---|
-| `GGML_LF_KQ_BLAS`<br>(default `fp8` when every GPU is a gfx1201; otherwise off) | 0001 K1 | `fp8`, `f16`, `0` | Prefill matmuls of quantized weights (not MXFP4; dense layers, not MoE experts) through hipBLASLt.  `fp8`: weights and activations in fp8, the fastest.  `f16`: weights converted to f16, KLD at the floor.  Only batches of 1024 tokens or more, so it needs `-ub` ≥ 1024.  The default needs the built-in gfx1201 algorithm lists; on other GPUs set it explicitly (the choice is then timed at startup and can change between runs). |
+| `GGML_LF_KQ_BLAS`<br>(default `fp8` when every GPU is a gfx1201; otherwise off) | 0001 K1 | `fp8`, `f16`, `0` | Prefill matmuls of quantized weights (not MXFP4; dense layers, not MoE experts) through hipBLASLt.  `fp8`: weights and activations in fp8, the fastest.  `f16`: weights converted to f16, KLD at the floor.  Batches of 384 tokens or more on weights of 20M elements or more, 1024 tokens or more on smaller weights (below that their fixed cost loses to MMQ).  The default needs the built-in gfx1201 algorithm lists; on other GPUs set it explicitly (the choice is then timed at startup and can change between runs). |
 | `GGML_LF_KQ_BLAS_FP8_KEEP`<br>(default `64`) | 0001 K1 | a number; `0` = off | K1 `fp8` only: per input batch, the channels with the largest activations (up to 248, rounded up to a multiple of 8) get a second fp8 term for their weight and activation rounding errors, appended to the same GEMM.  About half of the fp8 error above `f16` goes away for about 1% of prefill speed. |
 | `GGML_LF_DRAFT_UB`<br>(default `512`) | 0001 K1 | a number; `0` = no cap | Caps the draft model's ubatch (only ever lowers it).  With `-ub 2048`, `512` saves about 0.7 GiB of VRAM. |
 | `GGML_LF_FA_FP8`<br>(default on) | 0002 F8 | `1`, `0` | Prefill flash attention in fp8.  Runs only on RDNA4, with `-fa on` and a q8_0 KV cache (`-ctk q8_0 -ctv q8_0`), on batches of 32 tokens or more over 512 or more KV cells. |
@@ -37,7 +37,7 @@ for them.  0007 changes only how sampled drafts are accepted; 0012, 0014 and 001
 
 | parameter | why |
 |---|---|
-| `-ub 2048 -b 2048` | K1 takes only batches of 1024 tokens or more; 2048 is the fastest.  The main model's compute buffer grows by about 1.1 MiB per ubatch token: lower it (e.g. 1536) if a long context does not fit. |
+| `-ub 2048 -b 2048` | K1 is fastest on large batches (2048), and needs at least 1024 tokens on small weights.  The main model's compute buffer grows by about 1.1 MiB per ubatch token: lower it (e.g. 1536) if a long context does not fit. |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 runs only on a q8_0 KV cache with flash attention. |
 | `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | Only for 0014: an n-gram type before DFlash2.  Without it 0014 does nothing. |
 | `--spec-draft-sampling probabilistic` | Only for 0007.  llama.cpp's own parameter: sample the draft and verify it by rejection sampling (exact).  Faster on sampled code / math at temperature 0.7-1.0, can be slower at low temperature: measure on your own workload. |
@@ -60,7 +60,8 @@ turns on F8 alone).
 | variable | what it does |
 |---|---|
 | `GGML_LF_KQ_BLAS_LOG=1`, `GGML_LF_MXFP4_LOG=1` | Print each GEMM shape's algorithm choice (K1) / one line per weight tensor (M4). |
-| `GGML_LF_KQ_BLAS_MIN_T` (1024), `GGML_LF_FA_FP8_MIN_T` (32), `GGML_LF_FA_FP8_MIN_KV` (512), `GGML_LF_MXFP4_MIN_T` (64) | The minimum batch (tokens) or KV length each path takes; defaults in brackets. |
+| `GGML_LF_KQ_BLAS_MIN_T` (384), `GGML_LF_FA_FP8_MIN_T` (32), `GGML_LF_FA_FP8_MIN_KV` (512), `GGML_LF_MXFP4_MIN_T` (64) | The minimum batch (tokens) or KV length each path takes; defaults in brackets.  K1's applies to weights of 20M elements or more (smaller ones: at least 1024); `1024` gives 0001 v4's behaviour. |
+| `GGML_LF_KQ_BLAS_DIRECT` (on), `GGML_LF_KQ_BLAS_CHECK` (off) | 0001 v6: Q4_K / Q5_K / IQ4_XS weights converted without the LDS round trip (the same bytes); `0` uses the older kernels.  `CHECK=1` runs both on every conversion and logs differing bytes (diagnostics, slow). |
 | `GGML_LF_KQ_BLAS_SHARE=0`, `GGML_LF_MXFP4_SHARE=0` | Convert the activations for every matmul instead of once per input: same result, slower. |
 | `GGML_LF_MXFP4_AMAX=row`, `GGML_LF_MXFP4_CONV=row` | Alternative kernels for the activation scale / the MXFP4 conversion: same result. |
 | `GGML_LF_MXFP4_CFG`, `GGML_LF_MXFP4_SPLITK` | Experiments for M4's `fp8` kernel. |
@@ -87,7 +88,7 @@ turns on F8 alone).
 
 | 變數 | patch | 值 | 作用 |
 |---|---|---|---|
-| `GGML_LF_KQ_BLAS`<br>（預設：所有 GPU 都是 gfx1201 時為 `fp8`，否則關） | 0001 K1 | `fp8`、`f16`、`0` | 量化權重（MXFP4 除外；只有一般的矩陣乘，不含 MoE 專家）的 prefill 矩陣乘改走 hipBLASLt。`fp8`：權重與 activation 都轉 fp8，最快。`f16`：權重轉 f16，KLD 與底噪相同。只處理 1024 token 以上的批次，所以 `-ub` 要 ≥ 1024。預設值依賴內建的 gfx1201 演算法清單；其他顯卡請明確設定（這時會在啟動時實測挑選，結果可能每次不同）。 |
+| `GGML_LF_KQ_BLAS`<br>（預設：所有 GPU 都是 gfx1201 時為 `fp8`，否則關） | 0001 K1 | `fp8`、`f16`、`0` | 量化權重（MXFP4 除外；只有一般的矩陣乘，不含 MoE 專家）的 prefill 矩陣乘改走 hipBLASLt。`fp8`：權重與 activation 都轉 fp8，最快。`f16`：權重轉 f16，KLD 與底噪相同。權重 2000 萬元素以上的矩陣處理 384 token 以上的批次，較小的權重處理 1024 token 以上（再小時固定開銷輸給 MMQ）。預設值依賴內建的 gfx1201 演算法清單；其他顯卡請明確設定（這時會在啟動時實測挑選，結果可能每次不同）。 |
 | `GGML_LF_KQ_BLAS_FP8_KEEP`<br>（預設 `64`） | 0001 K1 | 數字；`0` 為關 | 只對 K1 `fp8`：每個輸入批次挑出 activation 最大的通道（最多 248，取 8 的倍數），把這些通道的權重與 activation 的 fp8 捨入誤差，當成第二個 fp8 項接在同一次矩陣乘裡。fp8 比 `f16` 多出的誤差約減半，prefill 約慢 1%。 |
 | `GGML_LF_DRAFT_UB`<br>（預設 `512`） | 0001 K1 | 數字；`0` 為不限 | 限制草稿模型的 ubatch（只會調小）。`-ub 2048` 時 `512` 約省 0.7 GiB 顯存。 |
 | `GGML_LF_FA_FP8`<br>（預設開） | 0002 F8 | `1`、`0` | prefill 的 flash attention 改用 fp8。只在 RDNA4、`-fa on` 且 KV 快取為 q8_0（`-ctk q8_0 -ctv q8_0`）時作用，批次 32 token 以上、KV 512 格以上。 |
@@ -111,7 +112,7 @@ turns on F8 alone).
 
 | 參數 | 原因 |
 |---|---|
-| `-ub 2048 -b 2048` | K1 只處理 1024 token 以上的批次，2048 最快。主模型的計算暫存區每個 ubatch token 約 1.1 MiB：長上下文放不下時可以降低（例如 1536）。 |
+| `-ub 2048 -b 2048` | K1 在大批次（2048）最快；小權重至少要 1024 token。主模型的計算暫存區每個 ubatch token 約 1.1 MiB：長上下文放不下時可以降低（例如 1536）。 |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 只在 flash attention＋q8_0 KV 快取上作用。 |
 | `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | 只有 0014 需要：n-gram 類型放在 DFlash2 前面。沒有它，0014 不會作用。 |
 | `--spec-draft-sampling probabilistic` | 只有 0007 需要。llama.cpp 自己的參數：草稿改為抽樣，以拒絕取樣驗證（無損）。溫度 0.7～1.0 的寫程式／數學變快，低溫時可能變慢：請用自己的工作負載實測。 |
@@ -133,7 +134,8 @@ turns on F8 alone).
 | 變數 | 作用 |
 |---|---|
 | `GGML_LF_KQ_BLAS_LOG=1`、`GGML_LF_MXFP4_LOG=1` | 印出每個矩陣形狀選到的演算法（K1）／每個權重一行（M4）。 |
-| `GGML_LF_KQ_BLAS_MIN_T`（1024）、`GGML_LF_FA_FP8_MIN_T`（32）、`GGML_LF_FA_FP8_MIN_KV`（512）、`GGML_LF_MXFP4_MIN_T`（64） | 各路徑接手的最小批次（token）或 KV 長度；括號內為預設值。 |
+| `GGML_LF_KQ_BLAS_MIN_T`（384）、`GGML_LF_FA_FP8_MIN_T`（32）、`GGML_LF_FA_FP8_MIN_KV`（512）、`GGML_LF_MXFP4_MIN_T`（64） | 各路徑接手的最小批次（token）或 KV 長度；括號內為預設值。K1 的門檻只用在 2000 萬元素以上的權重（較小的至少 1024）；設 `1024` 等於 0001 v4 的行為。 |
+| `GGML_LF_KQ_BLAS_DIRECT`（開）、`GGML_LF_KQ_BLAS_CHECK`（關） | 0001 v6：Q4_K／Q5_K／IQ4_XS 權重轉換不經 LDS（位元組相同、較快）；設 `0` 用舊 kernel。`CHECK=1` 每次轉換新舊各跑一次並記錄不同的位元組（診斷用，慢）。 |
 | `GGML_LF_KQ_BLAS_SHARE=0`、`GGML_LF_MXFP4_SHARE=0` | 每個矩陣乘都重新轉換 activation，而不是每個輸入只轉一次：結果相同、較慢。 |
 | `GGML_LF_MXFP4_AMAX=row`、`GGML_LF_MXFP4_CONV=row` | activation 縮放值／MXFP4 轉換的另一種 kernel：結果相同。 |
 | `GGML_LF_MXFP4_CFG`、`GGML_LF_MXFP4_SPLITK` | M4 `fp8` kernel 的實驗參數。 |

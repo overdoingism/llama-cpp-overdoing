@@ -1,0 +1,280 @@
+From 310e0ffd5090f757ac5757719a7172691b3e61bd Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:34:03 +0800
+Subject: [PATCH] K1 v4 -> v6: batches of 384..1023 tokens on large weights;
+ direct Q4_K / Q5_K / IQ4_XS conversion
+
+v6 = v4 with two changes:
+- batches of 384..1023 tokens go to K1 on weights of 20M elements or more (GGML_LF_KQ_BLAS_MIN_T, default 384, was 1024;
+  smaller weights keep 1024): a prompt's last batch, short prompts and the draft's batches no longer fall back to MMQ
+  (Qwen3.8-27B: prompts whose last batch is under 1024 tokens +6..+17 %; Qwen3.6-35B-A3B unchanged; KLD as K1's 2048-token
+  batches).  GGML_LF_KQ_BLAS_MIN_T=1024 gives v4's threshold.
+- Q4_K / Q5_K / IQ4_XS weights convert to fp8 (and, in the f16 mode, to f16) in one pass per thread from 8-byte loads, without
+  the LDS round trip: the same bytes (GGML_LF_KQ_BLAS_CHECK=1 compares them on every conversion), Q5_K -27 %, Q4_K -18 %
+  per conversion, prefill +1.4..+2.9 % (fp8) / +1.0..+1.2 % (f16).  GGML_LF_KQ_BLAS_DIRECT=0 gives the old kernels.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/lf-kq-blas.cu | 205 ++++++++++++++++++++++++++++++-
+ 1 file changed, 199 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cu b/ggml/src/ggml-cuda/lf-kq-blas.cu
+index ec6eb4d65..46cf5633e 100644
+--- a/ggml/src/ggml-cuda/lf-kq-blas.cu
++++ b/ggml/src/ggml-cuda/lf-kq-blas.cu
+@@ -3,6 +3,7 @@
+ #include "dequantize.cuh"
+ 
+ #include <atomic>
++#include <functional>
+ #include <cctype>
+ #include <cmath>
+ #include <cstring>
+@@ -60,7 +61,12 @@ bool lf_kq_on() { return lf_kq_mode() != 0; }
+ // K1 fp8, two-step weight conversion (the first use of a weight, types without a one-step kernel): the f16 chunk it dequantizes
+ // into stays in the 64 MB Infinity Cache at this size, so the f16 -> fp8 step does not read it back from DRAM (64 MiB: -4%)
+ constexpr int64_t LF_KQ8_CHUNK_BYTES = 32ll << 20;
+-int lf_kq_min_t() { static const int t = getenv("GGML_LF_KQ_BLAS_MIN_T") ? atoi(getenv("GGML_LF_KQ_BLAS_MIN_T")) : 1024; return t; }
++// K1 takes a matmul of GGML_LF_KQ_BLAS_MIN_T tokens or more (default 384) when the weight has 20M elements or more, and of
++// 1024 tokens or more otherwise: below 1024 tokens the fixed cost of a K1 call (amax, conversion, GEMM) beats MMQ only on
++// large weights (gfx1201: Qwen3.8-27B's 26..131M-element matrices +17..42% at 512..1023 tokens; the 1..17M-element dense
++// matrices of Qwen3.6-35B-A3B -1..-7%).  GGML_LF_KQ_BLAS_MIN_T=1024: 1024 for every weight, as before.
++int lf_kq_min_t() { static const int t = getenv("GGML_LF_KQ_BLAS_MIN_T") ? atoi(getenv("GGML_LF_KQ_BLAS_MIN_T")) : 384; return t; }
++constexpr int64_t LF_KQ_SMALL_T_MIN_WEIGHTS = 20ll << 20;
+ int lf_kq_log()   { static const int l = getenv("GGML_LF_KQ_BLAS_LOG")   ? atoi(getenv("GGML_LF_KQ_BLAS_LOG"))   : 0;    return l; }
+ // GGML_LF_KQ_BLAS_ALGOS selects how the algorithms are chosen (nothing is ever read from or written to a file):
+ //   unset          gfx1201: def.gfx1201v1; other GPUs: tune
+@@ -109,7 +115,8 @@ bool lf_kq_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1) {
+     if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_MXFP4 || ggml_get_to_fp16_cuda(src0->type) == nullptr) return false;
+     if (src1->type != GGML_TYPE_F32 || src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
+-    return src0->ne[0] % 64 == 0 && src0->ne[1] % 16 == 0 && T >= lf_kq_min_t() && T <= INT32_MAX / 8 && src0->ne[1] <= INT32_MAX / 8;
++    const int64_t min_t = src0->ne[0] * src0->ne[1] >= LF_KQ_SMALL_T_MIN_WEIGHTS ? lf_kq_min_t() : std::max(lf_kq_min_t(), 1024);
++    return src0->ne[0] % 64 == 0 && src0->ne[1] % 16 == 0 && T >= min_t && T <= INT32_MAX / 8 && src0->ne[1] <= INT32_MAX / 8;
+ }
+ 
+ #if defined(GGML_LF_HIPBLASLT)
+@@ -1040,14 +1047,200 @@ void lf_kq8_q_to_fp8_cuda(const void * vx, const float * scale, const uint8_t *
+         const int64_t nsb, cudaStream_t stream) {
+     lf_kq8_q_to_fp8<DQ><<<(unsigned) ((nsb + 7) / 8), dim3(DQ::nthr, 256 / DQ::nthr), 0, stream>>>(vx, scale, pos, k, w8, K, ld, nsb);
+ }
++// Direct conversion (no LDS round trip): each thread decodes the 8 consecutive values of one super-block that it writes, from
++// 8-byte loads of the packed quants, with the arithmetic of ggml's dequantize_<type> (float, rounded to half), so the fp8 bytes
++// are those of lf_kq8_q_to_fp8<lf_kq8_dq_<type>> and the f16 values those of to_fp16 (GGML_LF_KQ_BLAS_CHECK=1 compares both on
++// every conversion).  j: the first of the 8 values (a multiple of 8); h: the 8 values, already rounded to half.
++struct lf_kq_dec_q4_K {
++    static __device__ __forceinline__ void dec(const void * vx, const int64_t ib, const int j, float * h) {
++        const block_q4_K * x = (const block_q4_K *) vx + ib;
++        const int il = j / 64, hi = (j / 32) & 1, l0 = j % 32;
++        uint8_t sc, m;
++        get_scale_min_k4(2 * il + hi, x->scales, sc, m);
++        const float dall = __low2half(x->dm);
++        const float dmin = __high2half(x->dm);
++        const float d1 = dall * sc; const float m1 = dmin * m;
++        const uint2 q2 = *(const uint2 *) (x->qs + 32 * il + l0);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const uint8_t q = (uint8_t) (((i < 4 ? q2.x : q2.y) >> (8 * (i & 3))) & 0xff);
++            h[i] = __half2float(hi ? ggml_cuda_cast<half>(d1 * (q >>  4) - m1) : ggml_cuda_cast<half>(d1 * (q & 0xF) - m1));
++        }
++    }
++};
++struct lf_kq_dec_q5_K {
++    static __device__ __forceinline__ void dec(const void * vx, const int64_t ib, const int j, float * h) {
++        const block_q5_K * x = (const block_q5_K *) vx + ib;
++        const int il = j / 64, hi = (j / 32) & 1, l0 = j % 32, is = 2 * il + hi;
++        uint8_t sc, m;
++        get_scale_min_k4(is, x->scales, sc, m);
++        const float dall = __low2half(x->dm);
++        const float dmin = __high2half(x->dm);
++        const float d1 = dall * sc; const float m1 = dmin * m;
++        const uint2 ql2 = *(const uint2 *) (x->qs + 32 * il + l0);
++        const uint2 qh2 = *(const uint2 *) (x->qh + l0);
++        const uint8_t hm = 1 << is;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const uint8_t ql = (uint8_t) (((i < 4 ? ql2.x : ql2.y) >> (8 * (i & 3))) & 0xff);
++            const uint8_t qh = (uint8_t) (((i < 4 ? qh2.x : qh2.y) >> (8 * (i & 3))) & 0xff);
++            h[i] = __half2float(hi ? ggml_cuda_cast<half>(d1 * ((ql >>  4) + (qh & hm ? 16 : 0)) - m1)
++                                   : ggml_cuda_cast<half>(d1 * ((ql & 0xF) + (qh & hm ? 16 : 0)) - m1));
++        }
++    }
++};
++struct lf_kq_dec_iq4_xs {
++    static __device__ __forceinline__ void dec(const void * vx, const int64_t ibs, const int j, float * h) {
++        const block_iq4_xs * x = (const block_iq4_xs *) vx + ibs;
++        const int ib = j / 32, hi = (j / 16) & 1, l0 = j % 16;
++        const float d = (float) x->d * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
++        const uint2 q2 = *(const uint2 *) (x->qs + 16 * ib + l0);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const uint8_t q = (uint8_t) (((i < 4 ? q2.x : q2.y) >> (8 * (i & 3))) & 0xff);
++            h[i] = __half2float(hi ? ggml_cuda_cast<half>(d * kvalues_iq4nl[q >> 4]) : ggml_cuda_cast<half>(d * kvalues_iq4nl[q & 0xf]));
++        }
++    }
++};
++
++template <typename DEC>
++__launch_bounds__(256)
++__global__ void lf_kq8_direct_to_fp8(const void * __restrict__ vx, const float * __restrict__ scale, const uint8_t * __restrict__ pos,
++        const int k, uint8_t * __restrict__ w8, const int K, const int ld, const int64_t nsb) {
++#if defined(RDNA4)
++    const int64_t t  = (int64_t) blockIdx.x * 256 + threadIdx.x;   // 32 threads per super-block, 8 values each
++    const int64_t ib = t / 32;
++    if (ib >= nsb) return;
++    const int j = 8 * (int) (t % 32);
++    float h[8];
++    DEC::dec(vx, ib, j, h);
++    const int spb = K / QK_K;
++    const int64_t r = ib / spb;
++    const int     c = (int) (ib - r * spb) * QK_K + j;
++    const float inv = 1.f / scale[r];
++    int w[2];
++#pragma unroll
++    for (int q = 0; q < 2; ++q) {
++        w[q] = __builtin_amdgcn_cvt_pk_fp8_f32(h[4 * q + 0] * inv, h[4 * q + 1] * inv, 0, false);
++        w[q] = __builtin_amdgcn_cvt_pk_fp8_f32(h[4 * q + 2] * inv, h[4 * q + 3] * inv, w[q], true);
++    }
++    uint8_t * out = w8 + r * ld;
++    *(uint2 *) (out + c) = make_uint2((unsigned int) w[0], (unsigned int) w[1]);
++    if (k == 0) return;
++#pragma unroll
++    for (int q = 0; q < 2; ++q) {
++        const unsigned int p = *(const unsigned int *) (pos + c + 4 * q);
++        if (p == 0u) continue;
++        const float res[4] = { fmaf(h[4 * q + 0], inv, -__builtin_amdgcn_cvt_f32_fp8(w[q], 0)),
++                               fmaf(h[4 * q + 1], inv, -__builtin_amdgcn_cvt_f32_fp8(w[q], 1)),
++                               fmaf(h[4 * q + 2], inv, -__builtin_amdgcn_cvt_f32_fp8(w[q], 2)),
++                               fmaf(h[4 * q + 3], inv, -__builtin_amdgcn_cvt_f32_fp8(w[q], 3)) };
++#pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const int slot = (int) ((p >> (8 * l)) & 0xffu);
++            if (slot == 0) continue;
++            out[K + slot - 1]     = (uint8_t) ((w[q] >> (8 * l)) & 0xff);
++            out[K + k + slot - 1] = (uint8_t) (__builtin_amdgcn_cvt_pk_fp8_f32(res[l], 0.f, 0, false) & 0xff);
++        }
++    }
++#else
++    GGML_UNUSED_VARS(vx, scale, pos, k, w8, K, ld, nsb);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA4)
++}
++
++// the same values as f16 (K1's f16 mode), in to_fp16's layout: one 16-byte store per thread
++template <typename DEC>
++__launch_bounds__(256)
++__global__ void lf_kq_direct_to_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t nsb) {
++    const int64_t t  = (int64_t) blockIdx.x * 256 + threadIdx.x;
++    const int64_t ib = t / 32;
++    if (ib >= nsb) return;
++    const int j = 8 * (int) (t % 32);
++    float h[8];
++    DEC::dec(vx, ib, j, h);
++    half2 o[4];
++#pragma unroll
++    for (int l = 0; l < 4; ++l) o[l] = __halves2half2(__float2half(h[2 * l]), __float2half(h[2 * l + 1]));
++    *(uint4 *) (y + ib * QK_K + j) = *(const uint4 *) o;
++}
++
++static __global__ void lf_kq8_count_diff(const uint8_t * __restrict__ a, const uint8_t * __restrict__ b, const int64_t n, unsigned int * cnt) {
++    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
++    if (i < n && a[i] != b[i]) atomicAdd(cnt, 1u);
++}
++
++// GGML_LF_KQ_BLAS_DIRECT=0: the LDS kernels and to_fp16 as before (A/B in one build)
++static bool lf_kq8_direct() {
++    static const bool on = !getenv("GGML_LF_KQ_BLAS_DIRECT") || atoi(getenv("GGML_LF_KQ_BLAS_DIRECT")) != 0;
++    return on;
++}
++static bool lf_kq8_conv_check() {
++    static const bool on = getenv("GGML_LF_KQ_BLAS_CHECK") && atoi(getenv("GGML_LF_KQ_BLAS_CHECK")) != 0;
++    return on;
++}
++// diagnostics: run the direct and the reference conversion into zeroed scratch and count the differing bytes (synchronizes)
++static void lf_kq8_check_report(const char * what, const ggml_type type, const int64_t n, const std::function<void(uint8_t *)> & direct,
++        const std::function<void(uint8_t *)> & ref, cudaStream_t stream) {
++    static std::map<std::string, std::pair<uint64_t, uint64_t>> stats;
++    uint8_t * a; uint8_t * b; unsigned int * cnt;
++    CUDA_CHECK(cudaMalloc((void **) &a, n)); CUDA_CHECK(cudaMalloc((void **) &b, n)); CUDA_CHECK(cudaMalloc((void **) &cnt, 4));
++    CUDA_CHECK(cudaMemsetAsync(a, 0, n, stream)); CUDA_CHECK(cudaMemsetAsync(b, 0, n, stream)); CUDA_CHECK(cudaMemsetAsync(cnt, 0, 4, stream));
++    direct(a); ref(b);
++    lf_kq8_count_diff<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(a, b, n, cnt);
++    unsigned int h = 0;
++    CUDA_CHECK(cudaMemcpyAsync(&h, cnt, 4, cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaFree(a)); CUDA_CHECK(cudaFree(b)); CUDA_CHECK(cudaFree(cnt));
++    auto & st = stats[std::string(what) + " " + ggml_type_name(type)];
++    ++st.first; st.second += h != 0;
++    if (h != 0 || (st.first & (st.first - 1)) == 0) {
++        fprintf(stderr, "GGML_LF_KQ_BLAS_CHECK %s %s: call %llu (%lld bytes): %u bytes differ; calls with a difference so far %llu\n", what,
++                ggml_type_name(type), (unsigned long long) st.first, (long long) n, h, (unsigned long long) st.second);
++    }
++}
++
++template <typename DEC, typename DQ, ggml_type TYPE>
++void lf_kq8_direct_to_fp8_cuda(const void * vx, const float * scale, const uint8_t * pos, const int k, uint8_t * w8, const int K, const int ld,
++        const int64_t nsb, cudaStream_t stream) {
++    auto direct = [&](uint8_t * o) { lf_kq8_direct_to_fp8<DEC><<<(unsigned) ((nsb * 32 + 255) / 256), 256, 0, stream>>>(vx, scale, pos, k, o, K, ld, nsb); };
++    direct(w8);
++    if (!lf_kq8_conv_check()) return;
++    auto ref = [&](uint8_t * o) { lf_kq8_q_to_fp8<DQ><<<(unsigned) ((nsb + 7) / 8), dim3(DQ::nthr, 256 / DQ::nthr), 0, stream>>>(vx, scale, pos, k, o, K, ld, nsb); };
++    lf_kq8_check_report("fp8", TYPE, nsb / (K / QK_K) * ld, direct, ref, stream);
++}
++
++template <typename DEC, ggml_type TYPE>
++void lf_kq_direct_to_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
++    const int64_t nsb = k / QK_K;
++    auto direct = [&](uint8_t * o) { lf_kq_direct_to_f16<DEC><<<(unsigned) ((nsb * 32 + 255) / 256), 256, 0, stream>>>(vx, (half *) o, nsb); };
++    direct((uint8_t *) y);
++    if (!lf_kq8_conv_check()) return;
++    auto ref = [&](uint8_t * o) { ggml_get_to_fp16_cuda(TYPE)(vx, (half *) o, k, stream); };
++    lf_kq8_check_report("f16", TYPE, k * 2, direct, ref, stream);
++}
++
++// f16 conversion for K1's f16 mode: the direct kernels where there is one, else ggml's to_fp16
++static to_fp16_cuda_t lf_kq_to_fp16_for(const ggml_type type) {
++    if (lf_kq8_direct()) {
++        switch (type) {
++            case GGML_TYPE_Q4_K:   return lf_kq_direct_to_f16_cuda<lf_kq_dec_q4_K, GGML_TYPE_Q4_K>;
++            case GGML_TYPE_Q5_K:   return lf_kq_direct_to_f16_cuda<lf_kq_dec_q5_K, GGML_TYPE_Q5_K>;
++            case GGML_TYPE_IQ4_XS: return lf_kq_direct_to_f16_cuda<lf_kq_dec_iq4_xs, GGML_TYPE_IQ4_XS>;
++            default: break;
++        }
++    }
++    return ggml_get_to_fp16_cuda(type);
++}
++
+ // the one-step conversion of a weight type (super-block types only, rows of whole super-blocks), nullptr: the two-step path
+ lf_kq8_q_to_fp8_t lf_kq8_q_to_fp8_for(const ggml_type type, const int K) {
+     if (K % QK_K != 0) return nullptr;
+     switch (type) {
+         case GGML_TYPE_Q2_K:    return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q2_K>;
+         case GGML_TYPE_Q3_K:    return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q3_K>;
+-        case GGML_TYPE_Q4_K:    return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q4_K>;
+-        case GGML_TYPE_Q5_K:    return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q5_K>;
++        case GGML_TYPE_Q4_K:    return lf_kq8_direct() ? lf_kq8_direct_to_fp8_cuda<lf_kq_dec_q4_K, lf_kq8_dq_q4_K, GGML_TYPE_Q4_K> : lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q4_K>;
++        case GGML_TYPE_Q5_K:    return lf_kq8_direct() ? lf_kq8_direct_to_fp8_cuda<lf_kq_dec_q5_K, lf_kq8_dq_q5_K, GGML_TYPE_Q5_K> : lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q5_K>;
+         case GGML_TYPE_Q6_K:    return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_q6_K>;
+         case GGML_TYPE_IQ2_XXS: return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq2_xxs>;
+         case GGML_TYPE_IQ2_XS:  return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq2_xs>;
+@@ -1056,7 +1249,7 @@ lf_kq8_q_to_fp8_t lf_kq8_q_to_fp8_for(const ggml_type type, const int K) {
+         case GGML_TYPE_IQ3_S:   return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq3_s>;
+         case GGML_TYPE_IQ1_S:   return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq1_s>;
+         case GGML_TYPE_IQ1_M:   return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq1_m>;
+-        case GGML_TYPE_IQ4_XS:  return lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq4_xs>;
++        case GGML_TYPE_IQ4_XS:  return lf_kq8_direct() ? lf_kq8_direct_to_fp8_cuda<lf_kq_dec_iq4_xs, lf_kq8_dq_iq4_xs, GGML_TYPE_IQ4_XS> : lf_kq8_q_to_fp8_cuda<lf_kq8_dq_iq4_xs>;
+         default:                return nullptr;
+     }
+ }
+@@ -1573,7 +1766,7 @@ void ggml_cuda_lf_kq_blas_mul_mat(ggml_backend_cuda_context & ctx, const ggml_te
+         return r;
+     };
+ 
+-    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
++    const to_fp16_cuda_t to_fp16 = lf_kq_to_fp16_for(src0->type);
+     for (int r0 = 0; r0 < M; r0 += Mc) {
+         const int mc = std::min(Mc, M - r0);
+         // weight rows r0 .. r0+mc -> f16 (whole quant blocks: K is a multiple of 64)
+-- 
+2.43.0
+
