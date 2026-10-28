@@ -3,8 +3,8 @@
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
 for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, a faster decode / draft-verification
 matmul, a guard against replies that end inside the reasoning, an opt-in lenience for sampled drafts, faster wide draft
-verification, a smaller recurrent-state cache for draft verification, and fixes of upstream llama.cpp code that
-we keep here.
+verification, a smaller recurrent-state cache for draft verification, a smaller FFN compute buffer, and fixes of
+upstream llama.cpp code that we keep here.
 Most other bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
@@ -24,13 +24,14 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0005-605-backend-sampling-reserve-v1` | no buffer reallocation per request | —<br>(always on) | fix |
 | `0006-605-mmvk-v3` | faster 1-8 token K-quant matmuls | `GGML_CUDA_MMVK`<br>(default on) | speed/<br>diff |
 | `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE`<br>(default off) | speed/<br>lossy |
+| `0008-605-glu-inplace-v1` | an FFN's gate, up and GLU output not all live at once (150 MiB less compute buffer at `-ub 2048`) | `GGML_GLU_INPLACE`<br>(default on) | memory |
 | `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | speed/<br>diff |
 | `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
 | `0013-605-gdn-verify-anchor-v3` | Qwen3.x draft verification keeps two recurrent-state planes, not one per draft token (about 1 GiB less VRAM); a moved cell keeps its rollback snapshots | `LLAMA_RS_ANCHOR`<br>(default on);<br>`GGML_CUDA_GDN_NT`<br>(default on) | speed,<br>fix |
 | `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
 | `0015-605-spec-align-v2` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
 
-<sub>0008, 0010, 0011 (Temporarily)</sub>
+<sub>0010, 0011 (Temporarily)</sub>
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
@@ -60,6 +61,10 @@ a fifth (0.000396 to 0.000307, floor 0.00021); with all defaults the change is b
 `0009` changes only draft-verification batches of 9-16 rows (two slots verifying at once, or a long n-gram draft), which
 neither the KLD run nor the standard benchmark has; each of those rows then gets the result a batch of 8 rows or fewer gives.
 Two slots decoding at once at 50K each: 13-19% slower than one after the other without it, 33-38% faster with it.
+
+`0008`: the graph allocator lets a GLU write into its gate's memory, so an FFN's gate, up and GLU output are no longer all
+live at once: at `-ub 2048` the compute buffer is 150 MiB smaller on Qwen3.8-27B and 70 MiB on Qwen3.6-35B-A3B.  The output
+is the same, and prefill speed did not change.
 
 `0013` v3 (`LLAMA_RS_ANCHOR=0` turns the anchor off): draft verification on qwen35 / qwen35moe models (Qwen3.5 to 3.8) keeps, per slot, the
 recurrent state before and after the last batch plus small per-token replay factors, instead of one full state per draft

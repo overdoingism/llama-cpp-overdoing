@@ -1,0 +1,70 @@
+From b3908ca15c6330ae14a970f5019bdc4d454f377b Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 19:10:49 +0800
+Subject: [PATCH] ggml-alloc: a GLU may take its gate's memory
+ (GGML_GLU_INPLACE)
+
+GGML_OP_GLU joins ggml_op_can_inplace(), so the allocator may give a GLU the memory of a parent with the same layout and no
+other reader - the gate of a split GLU.  An FFN's gate, up and GLU output are then no longer all live at once: on
+Qwen3.8-27B (n_ff 17408) each is 136 MiB at a 2048-token ubatch, and the FFN of the last layers sets the compute buffer's
+peak.  The CPU and CUDA / HIP GLU kernels read each element before they write it; the K1 channel-amax GLU kernel drops its
+restrict qualifiers for that.  On unless GGML_GLU_INPLACE=0 (unset, GGML_LF_ALL=0: off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-alloc.c       | 16 ++++++++++++++++
+ ggml/src/ggml-cuda/unary.cu |  3 ++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 89b85fbce..8cb269e0e 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -18,6 +18,19 @@
+ //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+ #define AT_PRINTF(...)
+ 
++// GGML_GLU_INPLACE: a GLU may take the memory of its gate (same layout, no other reader), so the gate, the up and the GLU
++// output of an FFN are not all live at once (Qwen3.8-27B: 136 MiB each at a 2048-token ubatch).  The CPU and CUDA / HIP
++// GLU kernels read each element before they write it.  On unless 0 (unset, GGML_LF_ALL=0: off).
++static bool ggml_glu_inplace(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_GLU_INPLACE");
++        const char * a = getenv("GGML_LF_ALL");
++        on = e != NULL ? atoi(e) != 0 : !(a != NULL && a[0] == '0' && a[1] == '\0');
++    }
++    return on != 0;
++}
++
+ // ops that return true for this function must not use restrict pointers for their backend implementations
+ bool ggml_op_can_inplace(enum ggml_op op) {
+     switch (op) {
+@@ -45,6 +58,9 @@ bool ggml_op_can_inplace(enum ggml_op op) {
+         case GGML_OP_SOFT_MAX_BACK:
+             return true;
+ 
++        case GGML_OP_GLU:
++            return ggml_glu_inplace();
++
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index ad32d9250..047601daa 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -462,8 +462,9 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+ // Same products as unary_gated_op_kernel (f32), each thread one channel c of the K1 fp8 matmul that reads them (rows of kc =
+ // R whole rows of n) over 64 of its rows, also folding the channel's absolute maximum into that matmul's channel amax buffer
+ // (ggml_cuda_lf_kq8_amax_take), which then skips that pass.  Every product and its address are those of the plain kernel.
++// dst may be x (a GLU in place, GGML_GLU_INPLACE): each thread reads an element before it writes it, so no restrict.
+ template <float (*op)(float)>
+-static __global__ void unary_gated_chan_amax_kernel(const float * __restrict__ x, const float * __restrict__ g, float * __restrict__ dst,
++static __global__ void unary_gated_chan_amax_kernel(const float * x, const float * g, float * dst,
+         const int64_t n, const int64_t kc, const int64_t nrows, const int64_t o0, const int64_t o1, unsigned int * __restrict__ cbits) {
+     const int64_t c = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+     if (c >= kc) {
+-- 
+2.43.0
+
