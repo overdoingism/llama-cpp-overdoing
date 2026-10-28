@@ -1,20 +1,22 @@
-From 724954752374ff9016741a4d3bc8f50d2b27f849 Mon Sep 17 00:00:00 2001
+From 12acf22640bd85dfe670ac912d56c01754508732 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 14:44:43 +0800
-Subject: [PATCH] GDN verify v2: anchored rollback with replay
+Subject: [PATCH] GDN verify v3: anchored rollback with replay
  (LLAMA_RS_ANCHOR), non-temporal hints, moved cells keep their snapshots
 
-v2 keeps v1 (the 128-wide verify kernel loads the input state and stores the per-token snapshots non-temporally;
-GGML_CUDA_GDN_NT=0, or GGML_LF_ALL=0 with it unset: plain loads and stores) and adds two changes.
+v3 keeps v1 (the 128-wide verify kernel loads the input state and stores the per-token snapshots non-temporally;
+GGML_CUDA_GDN_NT=0, or GGML_LF_ALL=0 with it unset: plain loads and stores) and adds two changes; it is v2 with the
+anchored rollback on by default.
 
-Anchored rollback, off unless LLAMA_RS_ANCHOR=1 (qwen35 / qwen35moe, f32 state; a recurrent layer on a device other than
-CPU / CUDA / ROCm / MUSA turns it off).  A verify step no longer keeps one full recurrent state per drafted token (1 + n_rs_seq
-planes per cell): each cell keeps two planes - the state after its last batch and the state that batch started from - and the
-per-token replay factors of that batch (two factor rows per cell, by parity).  A partial accept is replayed from the start
-state when the cell is next read (new ops ggml_gated_delta_net_anchor, _anchor_rows and _replay, CPU and CUDA; the CUDA verify
-kernel writes the cache directly with non-temporal stores and reads the factor rows by id), and a state read with a rollback
-pending replays it first.  A batch longer than a factor row (n_rs_batch tokens) keeps no factors, the bound rollbacks already
-have.  The mechanism follows radiance's GDN verify (Apache-2.0); the code is new.
+Anchored rollback, on unless LLAMA_RS_ANCHOR=0 (unset, GGML_LF_ALL=0 turns it off; qwen35 / qwen35moe, f32 state; a
+recurrent layer on a device other than CPU / CUDA / ROCm / MUSA turns it off).  A verify step no longer keeps one full
+recurrent state per drafted token (1 + n_rs_seq planes per cell): each cell keeps two planes - the state after its last
+batch and the state that batch started from - and the per-token replay factors of that batch (two factor rows per cell, by
+parity).  A partial accept is replayed from the start state when the cell is next read (new ops ggml_gated_delta_net_anchor,
+_anchor_rows and _replay, CPU and CUDA; the CUDA verify kernel writes the cache directly with non-temporal stores and reads
+the factor rows by id), and a state read with a rollback pending replays it first.  A batch longer than a factor row
+(n_rs_batch tokens) keeps no factors, the bound rollbacks already have.  The mechanism follows radiance's GDN verify
+(Apache-2.0); the code is new.
 gfx1201 (R9700), Qwen3.8-27B UD-Q4_K_XL + DFlash2: VRAM after loading 30.00 -> 28.97 GiB (2 slots, -c 245760), 24.69 -> 24.18
 GiB (1 slot, -c 131072); Qwen3.6-35B-A3B 2 slots -0.42 GiB.  ms per step -0.39 % at 8K, -0.34 % at 110K; two slots decoding at
 once +2.3 to +4.0 %.  Outputs are the same with the anchor on and off: test-backend-ops (GDN 101/101, replay 38/38), XL and
@@ -40,14 +42,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  ggml/src/ggml.c                        | 117 +++++++++-
  src/llama-graph.cpp                    |  93 +++++++-
  src/llama-graph.h                      |  17 ++
- src/llama-memory-recurrent.cpp         | 256 +++++++++++++++++++-
+ src/llama-memory-recurrent.cpp         | 261 ++++++++++++++++++++-
  src/llama-memory-recurrent.h           |  42 +++-
  src/models/delta-net-base.cpp          | 124 ++++++++++
  src/models/models.h                    |  12 +
  src/models/qwen35.cpp                  |  10 +-
  src/models/qwen35moe.cpp               |  10 +-
  tests/test-backend-ops.cpp             | 155 +++++++++++++
- 18 files changed, 1286 insertions(+), 39 deletions(-)
+ 18 files changed, 1291 insertions(+), 39 deletions(-)
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
 index 692aaf7ff..60d3ff428 100644
@@ -1149,18 +1151,21 @@ index 735380a2a..50b9663aa 100644
  
      // used in view offsets, need to match for valid graph reuse
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index d39b6da9e..71e32a9ab 100644
+index d39b6da9e..9f4ebf5c2 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -37,6 +37,37 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -37,6 +37,42 @@ llama_memory_recurrent::llama_memory_recurrent(
  
      this->n_rs_seq   = n_rs_seq;
      this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
 +
-+    // anchored rollback (see the header): the scalar-gate delta-net models only
++    // anchored rollback (see the header): the scalar-gate delta-net models only; on unless LLAMA_RS_ANCHOR=0 (unset with
++    // GGML_LF_ALL=0: off)
 +    {
-+        const char * e = getenv("LLAMA_RS_ANCHOR");
-+        anchor = e != nullptr && atoi(e) != 0 && n_rs_seq > 0 && type_s == GGML_TYPE_F32 &&
++        const char * anchor_env = getenv("LLAMA_RS_ANCHOR");
++        const char * a          = getenv("GGML_LF_ALL");
++        const bool want = anchor_env != nullptr ? atoi(anchor_env) != 0 : !(a != nullptr && a[0] == '0' && a[1] == '\0');
++        anchor = want && n_rs_seq > 0 && type_s == GGML_TYPE_F32 &&
 +                 (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE);
 +        if (anchor) {
 +            const int64_t S   = hparams.ssm_d_state;
@@ -1181,7 +1186,9 @@ index d39b6da9e..71e32a9ab 100644
 +            const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
 +            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
 +                strcmp(reg, "CUDA") != 0 && strcmp(reg, "ROCm") != 0 && strcmp(reg, "MUSA") != 0) {
-+                LLAMA_LOG_WARN("%s: LLAMA_RS_ANCHOR: layer %d is on %s (%s), which has no anchored delta-net ops; anchored rollback disabled\n",
++                // a warning only when asked for (unset, these backends keep the snapshot planes as before)
++                llama_log_internal(anchor_env != nullptr ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
++                        "%s: LLAMA_RS_ANCHOR: layer %d is on %s (%s), which has no anchored delta-net ops; anchored rollback disabled\n",
 +                        __func__, i, ggml_backend_dev_name(dev), reg);
 +                anchor = false;
 +            }
@@ -1190,7 +1197,7 @@ index d39b6da9e..71e32a9ab 100644
      rs_idx.assign(n_seq_max, 0);
      last_ubatch_nseq_tokens_by_seq.assign(n_seq_max, 0);
      last_ubatch_pos_last_by_seq.assign(n_seq_max, -1);
-@@ -58,7 +89,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -58,7 +94,7 @@ llama_memory_recurrent::llama_memory_recurrent(
          if (it == ctx_map.end()) {
              ggml_init_params params = {
                  // r and s per layer, plus the separate PLE conv row where the model has one
@@ -1199,7 +1206,7 @@ index d39b6da9e..71e32a9ab 100644
                  /*.mem_buffer =*/ NULL,
                  /*.no_alloc   =*/ true,
              };
-@@ -79,6 +110,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -79,6 +115,7 @@ llama_memory_recurrent::llama_memory_recurrent(
      r_l.resize(n_layer);
      s_l.resize(n_layer);
      p_l.resize(n_layer);
@@ -1207,7 +1214,7 @@ index d39b6da9e..71e32a9ab 100644
  
      for (int i = 0; i < n_layer; i++) {
          if (filter && !filter(i)) {
-@@ -106,12 +138,18 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -106,12 +143,18 @@ llama_memory_recurrent::llama_memory_recurrent(
  
          const uint32_t n_rows = mem_size * (1 + n_rs_seq);
          ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
@@ -1227,7 +1234,7 @@ index d39b6da9e..71e32a9ab 100644
          // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
          if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
              ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
-@@ -144,6 +182,12 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -144,6 +187,12 @@ llama_memory_recurrent::llama_memory_recurrent(
              this->n_rs_seq = 0;
              LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
          }
@@ -1240,7 +1247,7 @@ index d39b6da9e..71e32a9ab 100644
      }
  
      {
-@@ -159,12 +203,19 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -159,12 +208,19 @@ llama_memory_recurrent::llama_memory_recurrent(
      }
  }
  
@@ -1260,7 +1267,7 @@ index d39b6da9e..71e32a9ab 100644
      }
  
      head = 0;
-@@ -238,7 +289,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+@@ -238,7 +294,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                          ? last_ubatch_nseq_tokens_by_seq[seq_id] : 0;
                  const llama_pos last_seq_pos  = ((size_t) seq_id < last_ubatch_pos_last_by_seq.size())
                          ? last_ubatch_pos_last_by_seq[seq_id] : -1;
@@ -1271,7 +1278,7 @@ index d39b6da9e..71e32a9ab 100644
                      if (getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr) {
                          LLAMA_LOG_WARN("%s: RSROLL seq=%d rollback=%d p0=%d last_global_nseq=%u last_global_pos=%d "
                                         "last_seq_nseq=%u last_seq_pos=%d n_rs_seq=%u n_rs_batch=%u\n",
-@@ -300,6 +353,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+@@ -300,6 +358,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                  }
                  cells[i].pos = -1;
                  cells[i].src = -1;
@@ -1279,7 +1286,7 @@ index d39b6da9e..71e32a9ab 100644
                  if (new_head == size) {
                      new_head = i;
                  }
-@@ -340,6 +394,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+@@ -340,6 +399,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
              if (cell_dst.seq_id.empty()) {
                  cell_dst.pos = -1;
                  cell_dst.src = -1;
@@ -1287,7 +1294,7 @@ index d39b6da9e..71e32a9ab 100644
                  used -= 1;
              }
          }
-@@ -367,6 +422,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+@@ -367,6 +427,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
  
              cells[i].pos = -1;
              cells[i].src = -1;
@@ -1295,7 +1302,7 @@ index d39b6da9e..71e32a9ab 100644
              cells[i].seq_id.clear();
  
              if (new_head == size){
-@@ -650,6 +706,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -650,6 +711,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
      const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
      const uint32_t n_seqs       = ubatch.n_seqs;
  
@@ -1308,7 +1315,7 @@ index d39b6da9e..71e32a9ab 100644
      // if we have enough unused cells before the current head ->
      //   better to start searching from the beginning of the cache, hoping to fill it
      if (head > used + 2*n_seqs) {
-@@ -691,6 +753,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -691,6 +758,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                      if (cell.seq_id.empty()) {
                          cell.pos = -1;
                          cell.src = -1;
@@ -1316,7 +1323,7 @@ index d39b6da9e..71e32a9ab 100644
                          used -= 1;
                      }
                  }
-@@ -749,6 +812,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -749,6 +817,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                  auto & orig_cell = cells[seq_meta.tail];
                  empty_cell.pos = orig_cell.pos;
                  empty_cell.src = orig_cell.src;
@@ -1328,7 +1335,7 @@ index d39b6da9e..71e32a9ab 100644
                  orig_cell.seq_id.erase(seq_id);
                  empty_cell.seq_id.insert(seq_id); // will be overwritten
                  GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
-@@ -780,6 +848,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -780,6 +853,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
              std::swap(dst_cell.pos, src_cell.pos);
              std::swap(dst_cell.src, src_cell.src);
              std::swap(dst_cell.seq_id, src_cell.seq_id);
@@ -1339,7 +1346,7 @@ index d39b6da9e..71e32a9ab 100644
  
              // swap tails
              for (uint32_t j = 0; j < size; ++j) {
-@@ -807,6 +879,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -807,6 +884,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                  __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
          }
          cell.pos = last_pos;
@@ -1351,7 +1358,7 @@ index d39b6da9e..71e32a9ab 100644
          cell.seq_id.clear();
          for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
              const llama_seq_id seq_id = ubatch.seq_id[i][j];
-@@ -815,6 +892,22 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -815,6 +897,22 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
          }
      }
  
@@ -1374,7 +1381,7 @@ index d39b6da9e..71e32a9ab 100644
      // Find first cell without src refs, to use as the zero-ed state
      {
          // TODO: bake-in src refcounts in the cell metadata
-@@ -916,6 +1009,11 @@ size_t llama_memory_recurrent::size_p_bytes() const {
+@@ -916,6 +1014,11 @@ size_t llama_memory_recurrent::size_p_bytes() const {
  void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
      GGML_UNUSED(flags);
  
@@ -1386,7 +1393,7 @@ index d39b6da9e..71e32a9ab 100644
      std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
      std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
      uint32_t cell_count = 0;
-@@ -930,7 +1028,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+@@ -930,7 +1033,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
              ++cell_count;
              uint32_t rs_idx_cur = 0;
  
@@ -1395,7 +1402,7 @@ index d39b6da9e..71e32a9ab 100644
                  if (seq_id != -1) {
                      GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
                      rs_idx_cur = rs_idx[seq_id];
-@@ -1235,6 +1333,8 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
+@@ -1235,6 +1338,8 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
          uint32_t cell_id = head + i;
          // make sure the recurrent states will keep their restored state
          cells[cell_id].src = cell_id;
@@ -1404,7 +1411,7 @@ index d39b6da9e..71e32a9ab 100644
      }
  
      return true;
-@@ -1413,6 +1513,122 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
+@@ -1413,6 +1518,122 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
      }
  }
  
@@ -1527,7 +1534,7 @@ index d39b6da9e..71e32a9ab 100644
  //
  // llama_memory_recurrent_context
  //
-@@ -1493,6 +1709,14 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+@@ -1493,6 +1714,14 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
      return mem->p_l[il];
  }
  
@@ -1542,7 +1549,7 @@ index d39b6da9e..71e32a9ab 100644
  int32_t llama_memory_recurrent_context::s_copy(int i) const {
      const uint32_t cell_idx = i + mem->head;
      const int32_t  src0     = mem->cells[cell_idx].src0;
-@@ -1512,3 +1736,27 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+@@ -1512,3 +1741,27 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
      }
      return (int32_t)(idx * mem->size) + src0;
  }
@@ -1571,7 +1578,7 @@ index d39b6da9e..71e32a9ab 100644
 +    mem->anchor_input((uint32_t) i, row, n_replay, fac_src, fac_dst);
 +}
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 5711521f5..ee9fc002f 100644
+index 5711521f5..b43b0c940 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
 @@ -27,7 +27,7 @@ public:
@@ -1587,7 +1594,7 @@ index 5711521f5..ee9fc002f 100644
      // per-seq rollback index
      std::vector<uint32_t> rs_idx;
  
-+    // anchored rollback (LLAMA_RS_ANCHOR=1, delta-net models): the ssm state has two planes instead of 1 + n_rs_seq --
++    // anchored rollback (LLAMA_RS_ANCHOR, on unless 0; delta-net models): the ssm state has two planes instead of 1 + n_rs_seq --
 +    // plane 0 the state after the cell's last batch, plane 1 the state that batch started from -- and each cell keeps
 +    // the replay factors of its last batch (ggml_gated_delta_net_anchor) in one of two factor rows, by parity.  A
 +    // rollback by r tokens is then the start state with the first n_fac - r tokens replayed; the conv state keeps its
