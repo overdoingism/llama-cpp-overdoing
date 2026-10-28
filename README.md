@@ -30,7 +30,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
 | `0015-605-spec-align-v2` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
 
-<sub>0010, 0011 (Temporarily)</sub>
+<sub>0008, 0010, 0011 (Temporarily)</sub>
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
@@ -87,7 +87,7 @@ without mmap) they count against the driver's limit.  Not needed on Windows.
 Tested on rdna-boosts `v15-6050b467c-r156`: the patches in `patches/` apply in number order on the plain release, build, and
 give the History numbers.  `0015` v2 needs r154 or later (it shares the release's own `LLAMA_SPEC_ALIGN`).  For r144 to r153,
 apply the same files except `0015` (its `git apply --check` fails there), then `patches/r144/0015-605-spec-align-v1.patch`;
-on Windows, r143 to r146 also need `patches/r144/0008-605-windows-moe-cache-close-v1.patch` (rdna-boosts has its fix since r147).
+on Windows use r147 or later (r143 to r146 do not compile there, rdna-boosts issue #231).
 On another release, check with `git apply --check` first.  A release on a new upstream base (not `6050b467c`) needs a new
 patch set.
 

@@ -1,8 +1,8 @@
 # Patches in detail
 
 What each patch in [`patches/`](patches) does, its switch (with the default under it), and what it needs; then the change log.
-[`patches/r144/`](patches/r144) holds `0015` v1 (for r144 to r153) and `0008` (the Windows build of r143 to r146; rdna-boosts
-has its fix since r147: `close()` calls in `moe-expert-cache.cu` that the Windows build does not declare, issue #231).  The short table is in
+[`patches/r144/`](patches/r144) holds `0015` v1 (for r144 to r153); on Windows use r147 or later (r143 to r146 do not compile
+there, rdna-boosts issue #231).  The short table is in
 the [README](README.md#patches).  Written with Claude (AI).
 
 | patch | what | switch | type | needs |
@@ -23,6 +23,8 @@ the [README](README.md#patches).  Written with Claude (AI).
 Type: `speed/lossy` = faster, with error above the run-to-run floor (or, for 0007, a bounded change of the output distribution); `speed/diff` = faster, output not bit-identical to the stock code but within the floor; `guard` = changes behavior only in a failure case; `fix` = a bug fix; `speed/trade-off` = faster on some workloads and slower on others, so off unless you ask for it.
 
 ## Change log
+
+**2026-10-28 (night):** `0008` withdrawn (the Windows build fix for r143 to r146): on Windows use r147 or later.
 
 **2026-10-28 (evening):** `0013` v3: the anchored rollback is on by default (`LLAMA_RS_ANCHOR=0` turns it off; left
 unset, `GGML_LF_ALL=0` turns it off too); otherwise the same as v2.  v2 users can apply

@@ -2,7 +2,7 @@
 
 Written with Claude (AI).  Every switch is an environment variable, read once when `llama-server` starts.  **The patches are
 on by default** (the default is under each variable): to turn one off, set it to `0`.  `GGML_LF_ALL=0` makes every switch you leave unset
-default to off; the build then behaves like plain rdna-boosts, apart from the fixes 0005 and 0013 (and 0008 where it applies).  `0007` is
+default to off; the build then behaves like plain rdna-boosts, apart from the fixes 0005 and 0013.  `0007` is
 the exception: off unless you ask for it (it is lossy).  Set the variables in the shell that starts the server (`NAME=value` before
 the command in bash, `$env:NAME = "value"` in PowerShell).
 
@@ -78,7 +78,7 @@ turns on F8 alone).
 
 # 開關
 
-本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次。**patch 預設都是開的**（預設值寫在每個變數下方）：要關哪一個，就把它設成 `0`。`GGML_LF_ALL=0` 會讓所有沒設的開關預設改成關；這時行為和原版 rdna-boosts 相同，只差 0005 與 0013 的修正（以及適用版本上的 0008）。`0007` 是例外：不設就是關（它有損）。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）。
+本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次。**patch 預設都是開的**（預設值寫在每個變數下方）：要關哪一個，就把它設成 `0`。`GGML_LF_ALL=0` 會讓所有沒設的開關預設改成關；這時行為和原版 rdna-boosts 相同，只差 0005 與 0013 的修正。`0007` 是例外：不設就是關（它有損）。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）。
 
 （`patches/r59/`、`patches/r50/`、`patches/a55/` 是舊版：那些版本不設就是關。）
 
