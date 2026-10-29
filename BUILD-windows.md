@@ -42,7 +42,7 @@ Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201,
   set `$env:GGML_LF_KQ_BLAS = "fp8"`.
 - Run from the folder of `llama-server.exe`, e.g. `$env:HIPBLASLT_TENSILE_LIBPATH = ".\gfx1201"` (relative to the current
   folder; give the full path when starting from elsewhere), then `.\llama-server.exe ... -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0`.
-  All switches: [SWITCHES.md](SWITCHES.md).  The log must show `K1 warm-up (2048 tokens, ...): fp8 GEMM ready for 8 shapes` (the line
+  With the draft model and n-gram drafts: the whole command in [README](README.md#run).  All switches: [SWITCHES.md](SWITCHES.md).  The log must show `K1 warm-up (2048 tokens, ...): fp8 GEMM ready for 8 shapes` (the line
   `GGML_LF_KQ_BLAS: f16 prefill GEMM through hipBLASLt on` is printed in either mode).
 
 ---
@@ -60,4 +60,4 @@ Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201,
 7. 編 `llama-server`。
 8. **把 `gfx1201` 資料夾複製到 `llama-server.exe` 旁邊**（上方指令最後兩行）：Windows 上 hipBLASLt 不會自己到 SDK 裡找 kernel。把 SDK 裡的 `hipblaslt\library\gfx1201` 資料夾複製到 `llama-server.exe` 所在的資料夾（`build\bin`），再用 `HIPBLASLT_TENSILE_LIBPATH` 指向這份複本。沒做的話 log 會出現 `hipBLASLt has no ... kernels`，K1 不會啟用。
 9. **K1 只有在程式看到的 GPU 全是 gfx1201 時才預設開。** CPU 的內顯如果也被 HIP 看到（`ggml_cuda_init: found 2 ROCm devices`），就把它藏起來（`$env:HIP_VISIBLE_DEVICES = "0"`，填 R9700 的編號），或直接設 `$env:GGML_LF_KQ_BLAS = "fp8"`。
-10. 在 `llama-server.exe` 所在的資料夾啟動，例如 `$env:HIPBLASLT_TENSILE_LIBPATH = ".\gfx1201"`（相對於目前資料夾；從別的地方啟動就寫完整路徑），再用 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0` 啟動 `llama-server.exe`。所有開關見 [SWITCHES.md](SWITCHES.md)。log 要出現 `K1 warm-up (2048 tokens, ...): fp8 GEMM ready for 8 shapes`（`GGML_LF_KQ_BLAS: f16 prefill GEMM through hipBLASLt on` 這行兩種模式都會印）。
+10. 在 `llama-server.exe` 所在的資料夾啟動，例如 `$env:HIPBLASLT_TENSILE_LIBPATH = ".\gfx1201"`（相對於目前資料夾；從別的地方啟動就寫完整路徑），再用 `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0` 啟動 `llama-server.exe`。加上草稿模型與 n-gram 草稿的完整指令見 [README](README.md#run)。所有開關見 [SWITCHES.md](SWITCHES.md)。log 要出現 `K1 warm-up (2048 tokens, ...): fp8 GEMM ready for 8 shapes`（`GGML_LF_KQ_BLAS: f16 prefill GEMM through hipBLASLt on` 這行兩種模式都會印）。

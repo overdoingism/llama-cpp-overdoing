@@ -42,6 +42,8 @@ for them.  0007 changes only how sampled drafts are accepted; 0012, 0014 and 001
 | `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | Only for 0014: an n-gram type before DFlash2.  Without it 0014 does nothing. |
 | `--spec-draft-sampling probabilistic` | Only for 0007.  llama.cpp's own parameter: sample the draft and verify it by rejection sampling (exact).  Faster on sampled code / math at temperature 0.7-1.0, can be slower at low temperature: measure on your own workload. |
 
+The whole command we run (draft model, n-gram drafts): [README](README.md#run).
+
 ## Turning everything off
 
 `GGML_LF_ALL=0`: every unset switch above defaults to off.  A switch you set still wins (e.g. `GGML_LF_ALL=0 GGML_LF_FA_FP8=1`
@@ -116,6 +118,8 @@ turns on F8 alone).
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 只在 flash attention＋q8_0 KV 快取上作用。 |
 | `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | 只有 0014 需要：n-gram 類型放在 DFlash2 前面。沒有它，0014 不會作用。 |
 | `--spec-draft-sampling probabilistic` | 只有 0007 需要。llama.cpp 自己的參數：草稿改為抽樣，以拒絕取樣驗證（無損）。溫度 0.7～1.0 的寫程式／數學變快，低溫時可能變慢：請用自己的工作負載實測。 |
+
+我們實際使用的完整指令（草稿模型、n-gram 草稿）：見 [README](README.md#run)。`--spec-type`、`--spec-ngram-mod-n-max`／`-n-min` 都是上游 llama.cpp 的參數（預設 64／48）；rdna-boosts 會把長度夾到 15、最短也跟著變 15，不設的話只會用到剛好 15 個 token 的 n-gram 草稿，所以我們設最短 8。DFlash2 草稿模型只適用 Qwen3.8-27B（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，Q4_K_M）。Windows 打包版附 `run-server-sample.ps1`，只要填模型路徑。
 
 ## 全部關掉
 

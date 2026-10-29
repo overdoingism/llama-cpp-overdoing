@@ -49,9 +49,11 @@ patch code is the same since); KLD measured again on r144 ([2026-10-27 report](r
 | mmvk (`0006`) | — (decode: 4.5-6% less time per step with drafts) | 0.0015 / 0.0003 (below the floor) |
 | **all defaults** | | **0.0025 / 0.0009** |
 
-K1, F8 and M4 leave decode unchanged; `0006` changes decode only (for its KLD the decode path runs it at one token, `GGML_CUDA_MMVK=4`).  `fp8` also raises the perplexity of the prompt's own logits (every position scored on the prefill path) by
-2-3% for Chinese text and 0.1-0.3% for English; generation reads the prompt through the KV cache and sees far less (the KLD column).
-For prompt-scoring workloads set `GGML_LF_KQ_BLAS=f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
+K1, F8 and M4 leave decode unchanged; `0006` changes decode only (for its KLD the decode path runs it at one token, `GGML_CUDA_MMVK=4`).  K1 `fp8` with F8 also raises the perplexity of the prompt's own logits (every position scored on the prefill path):
+by 0.1-0.3% on new text in Chinese, English or Thai and on a German novel, 0.6-0.8% on texts the model knows by heart, and
+2.4-3.6% on a text it half-remembers (Hong Lou Meng, our Chinese test text; this note used to read that as a Chinese
+effect).  Generation reads the prompt through the KV cache and sees far less (the KLD column; Thai at the level of Chinese
+and English).  For prompt-scoring workloads set `GGML_LF_KQ_BLAS=f16`.  Details: [2026-10-12 report](reports/2026-10-12.md).
 
 F8 v5 counts the row sum from the fp8 probabilities themselves: on a 170K-token reasoning conversation F8's own KLD drops by
 a fifth (0.000396 to 0.000307, floor 0.00021); with all defaults the change is below the floor, at the same prefill speed
@@ -123,7 +125,36 @@ Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.  From r144 to r156 the time
 
 - [Linux](BUILD-linux.md)
 - [Windows](BUILD-windows.md)
-- Then: [switches](SWITCHES.md)
+- Then: [run](#run), [switches](SWITCHES.md)
+
+## Run
+
+The patches are on by default.  Speculative decoding, which gives much of the generation speed, needs a draft model and
+these server parameters; this is what we run on an R9700 with Qwen3.8-27B (Linux; on Windows the same in PowerShell,
+without `HSA_USERPTR_FOR_PAGED_MEM`):
+
+```bash
+HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 131072 --kv-unified \
+  -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 \
+  -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf -ngld 99 --spec-draft-n-max 5 \
+  --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8 \
+  --spec-draft-sampling probabilistic
+```
+
+- `-ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0`: K1 and F8, the prefill speed-ups, need them
+  ([SWITCHES.md](SWITCHES.md#server-parameters-they-need)).
+- `-md ... -ngld 99 --spec-draft-n-max 5`: the DFlash2 draft model, for Qwen3.8-27B only
+  ([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), Q4_K_M).  With any other
+  model leave out the last three lines.
+- `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8`: upstream's n-gram drafts
+  ahead of DFlash2; with `0014` they are used only while the reply copies text it has seen (rewriting a whole file, for
+  example).  The parameters are upstream's (defaults 64 / 48); rdna-boosts clamps the length to 15 and the minimum with
+  it, so without them only 15-token n-gram drafts are kept.
+- `--spec-draft-sampling probabilistic`: llama.cpp's own; sampled drafts, verified exactly by rejection sampling (it
+  matters at temperature > 0).  `0007` (`LLAMA_SPEC_LENIENCE`, lossy, off by default) builds on it.
+- `HSA_USERPTR_FOR_PAGED_MEM=0`: Linux only ([Switches](#switches)).
+- The Windows package of the [GitHub Actions workflow](.github/workflows/windows-gfx1201.yml) comes with
+  [`run-server-sample.ps1`](packaging/windows/run-server-sample.ps1): these settings, with the two model paths to fill in.
 
 ## Thanks
 
