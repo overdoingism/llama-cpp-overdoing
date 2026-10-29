@@ -77,15 +77,23 @@ jobs:
           $r = $env:ROCM_ROOT
           $env:HIP_PATH = $r; $env:ROCM_PATH = $r; $env:HIP_PLATFORM = "amd"
           $env:HIP_DEVICE_LIB_PATH = "$r\lib\llvm\amdgcn\bitcode"; $env:PATH = "$r\bin;$env:PATH"
+          # on a failure the log's tail goes into an error annotation (the job logs need a sign-in to read, annotations do not)
+          function Fail($what, $log) {
+              $t = ((Get-Content $log -Tail 60) -join "`n").Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+              Write-Output "::error title=$what::$t"
+              exit 1
+          }
+          $log = Join-Path $env:RUNNER_TEMP "configure.log"
           cmake -S llama.cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DAMDGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON `
             -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU=ON `
             "-DCMAKE_PREFIX_PATH=$r" "-DHIP_PATH=$r" `
             "-DCMAKE_C_COMPILER=$r\lib\llvm\bin\clang.exe" "-DCMAKE_CXX_COMPILER=$r\lib\llvm\bin\clang++.exe" `
-            "-DCMAKE_HIP_COMPILER=$r\lib\llvm\bin\clang.exe" "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types"
-          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
-          cmake --build build --config Release -j 4 --target llama-server llama-cli llama-bench
-          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+            "-DCMAKE_HIP_COMPILER=$r\lib\llvm\bin\clang.exe" "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types" *>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { Fail "configure failed" $log }
+          $log = Join-Path $env:RUNNER_TEMP "build.log"
+          cmake --build build --config Release -j 4 --target llama-server llama-cli llama-bench *>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { Fail "build failed" $log }
 
       - name: Package
         shell: pwsh
