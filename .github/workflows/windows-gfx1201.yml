@@ -1,0 +1,104 @@
+# Windows build for gfx1201 (Radeon AI PRO R9700 / RX 9070 series): llama.cpp + llama-cpp-rdna-boosts + this repository's
+# patches, built with the ROCm 10.0.0 SDK for Windows (TheRock), packaged with the ROCm runtime DLLs, the hipBLASLt kernels for
+# gfx1201 and the licenses; a SHA-256 file and a build provenance attestation (`gh attestation verify <zip> --repo
+# overdoingism/llama-cpp-overdoing`) go with it.  No GPU is needed to build.  Written with Claude (AI).
+name: windows-gfx1201
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdna_boosts:
+        description: "llama-cpp-rdna-boosts release tag the patches are applied on"
+        default: "v15-6050b467c-r156"
+  push:
+    branches: [ci-windows]
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  RB_TAG: ${{ inputs.rdna_boosts || 'v15-6050b467c-r156' }}
+  ROCM_URL: https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx120X-all-10.0.0.tar.gz
+  ROCM_SHA256: 75da73c483cbc0456d9008f2079b333f4f9d3b7744705378ff8007e502ca38c5
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Git settings (the patches need LF line endings)
+        run: |
+          git config --global core.autocrlf false
+          git config --global user.name "ci"
+          git config --global user.email "ci@localhost"
+
+      - uses: actions/checkout@v4
+        with:
+          path: overdoing
+
+      - name: Sources (llama.cpp at the release's base, rdna-boosts, this repository's patches)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/stew675/llama-cpp-rdna-boosts rdna-boosts
+          git -C rdna-boosts checkout --quiet "$RB_TAG"
+          BASE=$(python -c "import json; print(json.load(open('rdna-boosts/release.json'))['base'])")
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp llama.cpp
+          git -C llama.cpp checkout --quiet "$BASE"
+          cd llama.cpp
+          bash ../rdna-boosts/scripts/apply-all.sh .
+          for p in ../overdoing/patches/0*-605-*.patch; do
+            echo "applying $(basename "$p")"
+            git apply "$p"
+          done
+          echo "SRC_REV=$(git rev-parse --short HEAD)+$(git -C ../overdoing rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: ROCm SDK for Windows (TheRock 10.0.0, gfx120X), checked against its SHA-256
+        shell: pwsh
+        run: |
+          $tar = Join-Path $env:RUNNER_TEMP "rocm.tar.gz"
+          curl.exe -fsSL -o $tar $env:ROCM_URL
+          $h = (Get-FileHash $tar -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:ROCM_SHA256) { throw "ROCm tarball SHA-256 $h, expected $env:ROCM_SHA256" }
+          $root = Join-Path $env:RUNNER_TEMP "rocm"
+          New-Item -ItemType Directory -Force $root | Out-Null
+          tar -xzf $tar -C $root
+          Remove-Item $tar
+          "ROCM_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
+
+      - uses: ilammy/msvc-dev-cmd@v1   # rc.exe and the Windows SDK libraries
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress | Out-Null
+          $r = $env:ROCM_ROOT
+          $env:HIP_PATH = $r; $env:ROCM_PATH = $r; $env:HIP_PLATFORM = "amd"
+          $env:HIP_DEVICE_LIB_PATH = "$r\lib\llvm\amdgcn\bitcode"; $env:PATH = "$r\bin;$env:PATH"
+          cmake -S llama.cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DAMDGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON `
+            -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU=ON `
+            "-DCMAKE_PREFIX_PATH=$r" "-DHIP_PATH=$r" `
+            "-DCMAKE_C_COMPILER=$r\lib\llvm\bin\clang.exe" "-DCMAKE_CXX_COMPILER=$r\lib\llvm\bin\clang++.exe" `
+            "-DCMAKE_HIP_COMPILER=$r\lib\llvm\bin\clang.exe" "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build --config Release -j 4 --target llama-server llama-cli llama-bench
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Package
+        shell: pwsh
+        run: overdoing\packaging\windows\package.ps1 -Build build\bin -Rocm $env:ROCM_ROOT -Out dist -Name "llama-cpp-overdoing-$env:RB_TAG-win-gfx1201"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-overdoing-${{ env.RB_TAG }}-win-gfx1201
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          retention-days: 30
