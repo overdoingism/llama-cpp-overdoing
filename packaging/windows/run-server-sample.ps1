@@ -28,6 +28,9 @@ $llamaArgs = @(
     "--cache-type-k", "q8_0"
     "--cache-type-v", "q8_0"
     "--jinja"
+    # this build has no OpenMP: llama.cpp's own CPU thread pool spins after the CPU part of every step unless it is told
+    # not to (Ryzen 7 5700G: about 4.3 cores while generating, 0.9 with --poll 0, at the same speed)
+    "--poll", "0"
     "--host", "127.0.0.1"
     "--port", "8080"
 )

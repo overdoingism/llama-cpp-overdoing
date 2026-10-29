@@ -131,7 +131,7 @@ Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.  From r144 to r156 the time
 
 The patches are on by default.  Speculative decoding, which gives much of the generation speed, needs a draft model and
 these server parameters; this is what we run on an R9700 with Qwen3.8-27B (Linux; on Windows the same in PowerShell,
-without `HSA_USERPTR_FOR_PAGED_MEM`):
+without `HSA_USERPTR_FOR_PAGED_MEM` and with `--poll 0`):
 
 ```bash
 HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 131072 --kv-unified \
@@ -153,6 +153,9 @@ HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 9
 - `--spec-draft-sampling probabilistic`: llama.cpp's own; sampled drafts, verified exactly by rejection sampling (it
   matters at temperature > 0).  `0007` (`LLAMA_SPEC_LENIENCE`, lossy, off by default) builds on it.
 - `HSA_USERPTR_FOR_PAGED_MEM=0`: Linux only ([Switches](#switches)).
+- `--poll 0`: Windows.  The Windows build has no OpenMP, so llama.cpp's own CPU thread pool spins after the CPU part of
+  every step: on a Ryzen 7 5700G with an R9700 the server used 4.2-4.4 cores while generating, 0.85-0.91 with
+  `--poll 0`, at the same speed and with the same text.  The Linux build uses OpenMP and does not need it.
 - The Windows package of the [GitHub Actions workflow](.github/workflows/windows-gfx1201.yml) comes with
   [`run-server-sample.ps1`](packaging/windows/run-server-sample.ps1): these settings, with the two model paths to fill in.
 
