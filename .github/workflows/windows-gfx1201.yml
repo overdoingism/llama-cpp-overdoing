@@ -25,7 +25,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022   # windows-latest (VS 2026, MSVC 14.51) failed every HIP file: see the commit
     timeout-minutes: 360
     steps:
       - name: Git settings (the patches need LF line endings)
