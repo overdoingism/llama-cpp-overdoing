@@ -1,4 +1,4 @@
-From 958b3d5c990b938dbe2850602f494b2ea3be75ee Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 16:10:57 +0800
 Subject: [PATCH] speculative: shadow n-gram drafting, on by default at 24
@@ -22,29 +22,30 @@ LLAMA_SPEC_NGRAM_SHADOW_EXACT=1 cuts a copying sequence's n-gram drafts to 7 tok
 the one without the n-gram speculator (copying then gains about half).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 958b3d5c990b938dbe2850602f494b2ea3be75ee)
 ---
  common/speculative.cpp | 108 +++++++++++++++++++++++++++++++++++++++++
  1 file changed, 108 insertions(+)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 492cc3e0a..622239f91 100644
+index f37505fde..74acf9f26 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2882,6 +2882,13 @@ struct common_speculative {
-     std::vector<common_speculative_impl *> impl_last;
+@@ -3062,6 +3062,13 @@ struct common_speculative {
  
      std::vector<double> synth_probs;
-+
+ 
 +    // LLAMA_SPEC_NGRAM_SHADOW (common_speculative_ngram_shadow), per seq: the last n-gram draft, the history length and
 +    // the token it continued, and how many of the target's tokens the n-gram drafts have predicted in a row
 +    std::vector<llama_tokens> shadow_g;
 +    std::vector<size_t>       shadow_len;
 +    std::vector<llama_token>  shadow_last;
 +    std::vector<int32_t>      shadow_run;
++
+     // common_speculative_align_wanted: the drafts of one call are cut to one length
+     bool align = false;
  };
- 
- static common_ngram_map get_common_ngram_map(
-@@ -3521,6 +3528,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3706,6 +3713,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          /* .impls       = */ std::move(impls),
          /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
          /* .synth_probs = */ {},
@@ -52,10 +53,10 @@ index 492cc3e0a..622239f91 100644
 +        /* .shadow_len  = */ {},
 +        /* .shadow_last = */ {},
 +        /* .shadow_run  = */ {},
+         /* .align       = */ common_speculative_align_wanted(params.draft.ctx_tgt),
      });
  
-     const int32_t n_max_configured = common_speculative_n_max(&params);
-@@ -3603,6 +3614,67 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+@@ -3789,6 +3800,67 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
      return result;
  }
  
@@ -123,7 +124,7 @@ index 492cc3e0a..622239f91 100644
  void common_speculative_draft(common_speculative * spec) {
      if (spec == nullptr) {
          return;
-@@ -3610,6 +3682,29 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3796,6 +3868,29 @@ void common_speculative_draft(common_speculative * spec) {
  
      auto & dparams = spec->dparams;
  
@@ -150,10 +151,10 @@ index 492cc3e0a..622239f91 100644
 +        }
 +    }
 +
-     {
-         int n_drafting = 0;
- 
-@@ -3644,6 +3739,19 @@ void common_speculative_draft(common_speculative * spec) {
+     std::vector<llama_seq_id> asked;
+     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+         if (dparams[seq_id].drafting) {
+@@ -3848,6 +3943,19 @@ void common_speculative_draft(common_speculative * spec) {
  
              auto & result = *dp.result;
  

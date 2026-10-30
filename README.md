@@ -28,8 +28,8 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | speed/<br>diff |
 | `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
 | `0013-605-gdn-verify-anchor-v3` | Qwen3.x draft verification keeps two recurrent-state planes, not one per draft token (about 1 GiB less VRAM); a moved cell keeps its rollback snapshots | `LLAMA_RS_ANCHOR`<br>(default on);<br>`GGML_CUDA_GDN_NT`<br>(default on) | speed,<br>fix |
-| `0014-605-ngram-shadow-v1` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
-| `0015-605-spec-align-v2` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
+| `optional/0014-605-ngram-shadow-v1b` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
+| `0015-605-spec-align-v3` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
 
 <sub>0010, 0011 (Temporarily)</sub>
 
@@ -92,7 +92,7 @@ without mmap) they count against the driver's limit.  Not needed on Windows.
 ## Applicable versions
 
 Tested on rdna-boosts `v15-6050b467c-r156`: the patches in `patches/` apply in number order on the plain release, build, and
-give the History numbers.  `0015` v2 needs r154 or later (it shares the release's own `LLAMA_SPEC_ALIGN`).  For r144 to r153,
+give the History numbers.  `0015` v3 needs r154 or later (it shares the release's own `LLAMA_SPEC_ALIGN`).  For r144 to r153,
 apply the same files except `0015` (its `git apply --check` fails there), then `patches/r144/0015-605-spec-align-v1.patch`;
 on Windows use r147 or later (r143 to r146 do not compile there, rdna-boosts issue #231).
 On another release, check with `git apply --check` first.  A release on a new upstream base (not `6050b467c`) needs a new

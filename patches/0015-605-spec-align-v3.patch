@@ -1,4 +1,4 @@
-From af3e4b18c8a2b185f0f5ad1d80b7680bc2138e83 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 16:10:57 +0800
 Subject: [PATCH] speculative: sequences verifying in one batch send drafts of
@@ -16,7 +16,7 @@ that made a cut draft is told (truncated()), so DFlash2's acceptance estimates c
 
 With it, two slots at once: 8K +0.1 % and 50K within noise against fixed width 5 (0012 on); a copying slot next to a zh
 slot: copying +32 %, the zh slot +0.9 %, the pair +24.8 % against DFlash2 alone (0012 and 0014 on).  Only on hybrid /
-recurrent targets; LLAMA_SPEC_ALIGN=0 turns it off, and unset with GGML_LF_ALL=0 it is off.  Needs 0012 and 0014 (context).
+recurrent targets; LLAMA_SPEC_ALIGN=0 turns it off, and unset with GGML_LF_ALL=0 it is off.  Needs 0012 (context).
 
 From r154 the release has its own LLAMA_SPEC_ALIGN for draft-mtp-adaptive (spec_align_enabled()); this patch reads the
 same switch.  The cut (and the raise of 0012's width it relies on) has its own switch, LLAMA_SPEC_ALIGN_CUT (on unless 0):
@@ -31,7 +31,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 134 insertions(+), 5 deletions(-)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index c4f20bc36..74acf9f26 100644
+index 854b9e589..f37505fde 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -208,6 +208,41 @@ static bool spec_align_enabled() {
@@ -186,27 +186,27 @@ index c4f20bc36..74acf9f26 100644
  };
  
  struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-@@ -2996,6 +3068,9 @@ struct common_speculative {
-     std::vector<size_t>       shadow_len;
-     std::vector<llama_token>  shadow_last;
-     std::vector<int32_t>      shadow_run;
+@@ -2989,6 +3061,9 @@ struct common_speculative {
+     std::vector<common_speculative_impl *> impl_last;
+ 
+     std::vector<double> synth_probs;
 +
 +    // common_speculative_align_wanted: the drafts of one call are cut to one length
 +    bool align = false;
  };
  
  static common_ngram_map get_common_ngram_map(
-@@ -3642,6 +3717,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
-         /* .shadow_len  = */ {},
-         /* .shadow_last = */ {},
-         /* .shadow_run  = */ {},
+@@ -3631,6 +3706,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+         /* .impls       = */ std::move(impls),
+         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+         /* .synth_probs = */ {},
 +        /* .align       = */ common_speculative_align_wanted(params.draft.ctx_tgt),
      });
  
      const int32_t n_max_configured = common_speculative_n_max(&params);
-@@ -3815,6 +3891,13 @@ void common_speculative_draft(common_speculative * spec) {
-         }
-     }
+@@ -3720,6 +3796,13 @@ void common_speculative_draft(common_speculative * spec) {
+ 
+     auto & dparams = spec->dparams;
  
 +    std::vector<llama_seq_id> asked;
 +    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
@@ -218,7 +218,7 @@ index c4f20bc36..74acf9f26 100644
      {
          int n_drafting = 0;
  
-@@ -3832,6 +3915,17 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3737,6 +3820,17 @@ void common_speculative_draft(common_speculative * spec) {
      }
  
      for (auto & impl : spec->impls) {
@@ -236,7 +236,7 @@ index c4f20bc36..74acf9f26 100644
          {
              common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
              impl->draft(dparams);
-@@ -3909,6 +4003,37 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3801,6 +3895,37 @@ void common_speculative_draft(common_speculative * spec) {
              dp.drafting = false;
          }
      }
