@@ -32,7 +32,7 @@ Without the script:
     $env:HIPBLASLT_TENSILE_LIBPATH = ".\gfx1201"
     .\llama-server.exe -m <model.gguf> -ngl 99 -c 131072 -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 --kv-unified `
       -md <Qwen3.8-27B-DFlash2-Q4_K_M.gguf> -ngld 99 --spec-draft-n-max 5 `
-      --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8 `
+      --spec-type draft-dflash `
       --spec-draft-sampling probabilistic --poll 0
 
 All switches: SWITCHES.md in the repository.

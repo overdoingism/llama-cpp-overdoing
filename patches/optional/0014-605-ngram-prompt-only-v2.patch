@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:13:29 +0800
+Subject: [PATCH] speculative: ngram-mod looks up only the current prompt, with
+ a key check
+
+ngram-mod's table has 4M slots and no key: a lookup that lands on another n-gram's slot returns that slot's token, so with a
+90K-token prompt about 2 % of the lookups hit whatever was asked.  A large n-min hides that; with a small one each such hit
+is a one-token draft that is nearly always wrong and takes the step from the drafter behind it.
+
+Each sequence now has its own table, rebuilt from the prompt when a request begins; generated tokens are not added.  Each
+slot keeps a 32-bit tag of its n-gram and a lookup with another tag is a miss (32 MiB per sequence).  A hit goes first; a
+miss leaves the step to the drafter behind, as before.
+
+Qwen3.8-27B UD-Q4_K_XL + DFlash2, --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1
+--spec-ngram-mod-n-match 30 against --spec-type draft-dflash, one request at a time: whole-file edits +66 % without thinking,
++33 % thinking first (the model copies the file while thinking), +43 % with the opencode tools defined (the copy while
+thinking; the arguments of a write call were not measured).  15 ERP and opencode requests
+within +-0.8 %, same text; a Rust request +0.5 %, a Chinese continuation +0.4 %, an English one -3.8 % (two more steps).  Two slots, rewriting next to
+a Chinese continuation: pair +17 %, the Chinese slot -5 %.  Not bit-identical while copying: a copying step verifies up to 16
+rows, whose kernels differ from decode's.
+
+LLAMA_SPEC_NGRAM_PROMPT_ONLY=0 restores upstream's table; unset with GGML_LF_ALL=0: off.  Without an n-gram type nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/ngram-mod.cpp   | 30 +++++++++++++++++++++-------
+ common/ngram-mod.h     |  7 ++++++-
+ common/speculative.cpp | 44 ++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 69 insertions(+), 12 deletions(-)
+
+diff --git a/common/ngram-mod.cpp b/common/ngram-mod.cpp
+index 1b5a09a5e..7ab120aba 100644
+--- a/common/ngram-mod.cpp
++++ b/common/ngram-mod.cpp
+@@ -6,36 +6,52 @@
+ // common_ngram_mod
+ //
+ 
+-common_ngram_mod::common_ngram_mod(uint16_t n, size_t size) : n(n), used(0) {
++common_ngram_mod::common_ngram_mod(uint16_t n, size_t size, bool verify) : n(n), used(0) {
+     entries.resize(size);
+ 
++    if (verify) {
++        tags.resize(size);
++    }
++
+     reset();
+ }
+ 
+-size_t common_ngram_mod::idx(const entry_t * tokens) const {
+-    size_t res = 0;
++uint64_t common_ngram_mod::hash(const entry_t * tokens) const {
++    uint64_t res = 0;
+ 
+     for (size_t i = 0; i < n; ++i) {
+         res = res*6364136223846793005ULL + tokens[i];
+     }
+ 
+-    res = res % entries.size();
+-
+     return res;
+ }
+ 
++size_t common_ngram_mod::idx(const entry_t * tokens) const {
++    return hash(tokens) % entries.size();
++}
++
+ void common_ngram_mod::add(const entry_t * tokens) {
+-    const size_t i = idx(tokens);
++    const uint64_t h = hash(tokens);
++    const size_t   i = h % entries.size();
+ 
+     if (entries[i] == EMPTY) {
+         used++;
+     }
+ 
+     entries[i] = tokens[n];
++
++    if (!tags.empty()) {
++        tags[i] = h >> 32;
++    }
+ }
+ 
+ common_ngram_mod::entry_t common_ngram_mod::get(const entry_t * tokens) const {
+-    const size_t i = idx(tokens);
++    const uint64_t h = hash(tokens);
++    const size_t   i = h % entries.size();
++
++    if (!tags.empty() && tags[i] != (uint32_t) (h >> 32)) {
++        return EMPTY;
++    }
+ 
+     return entries[i];
+ }
+diff --git a/common/ngram-mod.h b/common/ngram-mod.h
+index 7af92e9dd..3d2958613 100644
+--- a/common/ngram-mod.h
++++ b/common/ngram-mod.h
+@@ -15,7 +15,8 @@ struct common_ngram_mod {
+ 
+     static constexpr entry_t EMPTY = -1;
+ 
+-    common_ngram_mod(uint16_t n, size_t size);
++    // verify: keep a 32-bit tag of each n-gram, so a lookup that lands on another n-gram's slot is a miss
++    common_ngram_mod(uint16_t n, size_t size, bool verify = false);
+ 
+     size_t  idx(const entry_t * tokens) const;
+     void    add(const entry_t * tokens);
+@@ -35,4 +36,8 @@ private:
+     size_t used;
+ 
+     std::vector<entry_t> entries;
++
++    std::vector<uint32_t> tags; // empty without verify
++
++    uint64_t hash(const entry_t * tokens) const;
+ };
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f37505fde..4bd0698d5 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2728,12 +2728,32 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
+     }
+ };
+ 
++// LLAMA_SPEC_NGRAM_PROMPT_ONLY (default on; 0: off): ngram-mod looks up only the prompt of the sequence's current request: each
++// sequence has its own table, rebuilt when a request begins, and generated tokens are never added to it.  The table checks a tag
++// of the n-gram on lookup: without it a lookup hits with probability equal to the occupancy (2 % at a 90K prompt) whatever was
++// asked, which is what a large n-min hides, and with n-min 1 each such hit costs a step of the drafter behind it.
++// Unset with GGML_LF_ALL=0: off.
++static bool common_speculative_ngram_prompt_only() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SPEC_NGRAM_PROMPT_ONLY");
++        if (e != nullptr) {
++            return atoi(e) != 0;
++        }
++        const char * a = getenv("GGML_LF_ALL");
++        return !(a != nullptr && atoi(a) == 0);
++    }();
++    return v;
++}
++
+ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+     common_params_speculative_ngram_mod params;
+ 
+     // shared across all sequences
+     common_ngram_mod mod;
+ 
++    // LLAMA_SPEC_NGRAM_PROMPT_ONLY: one table per sequence instead
++    std::vector<common_ngram_mod> mods;
++
+     // enable trace logging if LLAMA_TRACE is set
+     const bool verbose;
+ 
+@@ -2755,7 +2775,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+             uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
+         , params(params.ngram_mod)
+-        , mod(params.ngram_mod.n_match, 4*1024*1024)
++        , mod(params.ngram_mod.n_match, common_speculative_ngram_prompt_only() ? 1 : 4*1024*1024)
+         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
+         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+ 
+@@ -2771,14 +2791,27 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+         }
+ 
+         sinfos.resize(n_seq);
++
++        if (common_speculative_ngram_prompt_only()) {
++            mods.assign(n_seq, common_ngram_mod(params.ngram_mod.n_match, 4*1024*1024, true));
++        }
++    }
++
++    common_ngram_mod & table(llama_seq_id seq_id) {
++        return mods.empty() ? mod : mods[seq_id];
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+         auto & sinfo = sinfos[seq_id];
++        auto & mod   = table(seq_id);
+ 
+         sinfo.i_last = 0;
+         sinfo.n_draft_last = 0;
+ 
++        if (!mods.empty()) {
++            mod.reset();
++        }
++
+         const size_t n = mod.get_n();
+         if (prompt.size() < n) {
+             return;
+@@ -2806,6 +2839,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+             common_speculative_draft_params & dparams) {
+         auto & sinfo = sinfos[seq_id];
+         auto & result = *dparams.result;
++        auto & mod    = table(seq_id);
+ 
+         const auto & prompt = *dparams.prompt;
+ 
+@@ -2819,7 +2853,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+         const size_t n = mod.get_n();
+ 
+         // add new ngrams in chunks
+-        if (sinfo.i_last + 32 < cur_len) {
++        if (mods.empty() && sinfo.i_last + 32 < cur_len) {
+             for (size_t i = sinfo.i_last; i < cur_len - n; ++i) {
+                 mod.add(prompt.data() + i);
+             }
+@@ -2892,9 +2926,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+                         SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
+                     }
+ 
+-                    mod.reset();
++                    if (mods.empty()) { // a per-request prompt table could not be rebuilt from here
++                        mod.reset();
++                        sinfo.i_last = 0;
++                    }
+                     sinfo.n_low = 0;
+-                    sinfo.i_last = 0;
+                 }
+             } else {
+                 sinfo.n_low = 0;
+-- 
+2.43.0
+

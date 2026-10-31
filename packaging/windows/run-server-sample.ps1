@@ -39,10 +39,7 @@ if ($draftPath) {
         "--model-draft", $draftPath
         "--n-gpu-layers-draft", "99"
         "--spec-draft-n-max", "5"
-        # n-gram drafts (up to 15 tokens, at least 8) take over only while the reply copies text (0014)
-        "--spec-type", "ngram-mod,draft-dflash"
-        "--spec-ngram-mod-n-max", "15"
-        "--spec-ngram-mod-n-min", "8"
+        "--spec-type", "draft-dflash"
         # sampled drafts, verified exactly by rejection sampling (llama.cpp's own; matters at temperature > 0)
         "--spec-draft-sampling", "probabilistic"
     )

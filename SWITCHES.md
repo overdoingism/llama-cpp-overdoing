@@ -26,7 +26,7 @@ the command in bash, `$env:NAME = "value"` in PowerShell).
 | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | 0012 | `1`, `2`, `0` | DFlash2 drafts each sequence's own width (1 to `--spec-draft-n-max`) from running acceptance estimates; the output does not change.  `2` also logs the width changes and, per request, the verifications per width.  `0`: the fixed width.  `LLAMA_DFLASH_ADAPTIVE_COST` (`0.035`) and `LLAMA_DFLASH_ADAPTIVE_JUMP` (`0.08`) set the cost model. |
 | `GGML_CUDA_GDN_NT`<br>(default on) | 0013 | `1`, `0` | The Gated DeltaNet verify kernel (qwen35 / qwen35moe, draft verification) reads the recurrent state and writes its per-token snapshots with non-temporal hints, so they do not push the next matmuls' weights out of the cache.  Same values. |
 | `LLAMA_RS_ANCHOR`<br>(default on) | 0013 v3 | `1`, `0` | qwen35 / qwen35moe with drafts: each slot keeps two recurrent-state planes (after its last batch, and the one that batch started from) and the batch's per-token replay factors instead of one full state per draft token; a partly rejected draft is replayed from the start state.  Same output; about 1 GiB less VRAM with 2 slots (0.5 GiB with 1), slightly faster.  Needs every recurrent layer on the CPU or a CUDA / ROCm GPU (otherwise the log says it is off).  Before v3 (0013 v2) it was off unless set to `1`. |
-| `LLAMA_SPEC_NGRAM_SHADOW`<br>(default `24`) | 0014 | a number; `0` = off | Only with an n-gram type ahead of a model drafter (`--spec-type ngram-mod,draft-dflash`).  The n-gram drafts are held back until they have predicted this many of the model's tokens in a row; then they are verified (up to `--spec-ngram-mod-n-max`) without DFlash2, until one misses.  `0`: the n-gram drafts always go first, as upstream.  `LLAMA_SPEC_NGRAM_SHADOW_EXACT=1` cuts them to 7 tokens, so the greedy output is the one without the n-gram type. |
+| `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>(default on) | optional 0014 | `1`, `0` | Only with `ngram-mod`.  Each sequence looks up n-gram drafts only in its current prompt, in its own table with a key check; generated tokens are not added.  `0`: upstream's shared table without the check. |
 | `LLAMA_SPEC_ALIGN`<br>(default on) | 0015 | `1`, `0` | Hybrid / recurrent models only: sequences that verify drafts in the same batch send drafts of one length (DFlash2's adaptive width aligns up to the others, up to `--spec-draft-n-max`; a longer draft is cut to the shortest), so the verify batch is not split into ubatches.  From r154 rdna-boosts reads the same variable for its own alignment of `draft-mtp-adaptive`: `0` turns off both; with `GGML_LF_ALL=0` and the variable unset, ours is off and the release's stays on. |
 | `LLAMA_SPEC_ALIGN_CUT`<br>(default on) | 0015 v2 | `1`, `0` | The cut of the drafts of one call to the shortest one, and the raise of DFlash2's width to a draft another drafter already made, which it relies on.  `0`: unequal drafts are left to the ubatch split, as in the release (rdna-boosts measured the cut as a loss where an n-gram draft is short because of its content; here it removes a mismatch of two caps, a copying slot's 15-token n-gram draft next to DFlash2's block). |
 
@@ -39,10 +39,10 @@ for them.  0007 changes only how sampled drafts are accepted; 0012, 0014 and 001
 |---|---|
 | `-ub 2048 -b 2048` | K1 is fastest on large batches (2048), and needs at least 1024 tokens on small weights.  The main model's compute buffer grows by about 1.1 MiB per ubatch token: lower it (e.g. 1536) if a long context does not fit. |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 runs only on a q8_0 KV cache with flash attention. |
-| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | Only for 0014: an n-gram type before DFlash2.  Without it 0014 does nothing. |
+| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` | Only for optional 0014: an n-gram type before DFlash2.  Without it 0014 does nothing. |
 | `--spec-draft-sampling probabilistic` | Only for 0007.  llama.cpp's own parameter: sample the draft and verify it by rejection sampling (exact).  Faster on sampled code / math at temperature 0.7-1.0, can be slower at low temperature: measure on your own workload. |
 
-The whole command we run (draft model, n-gram drafts): [README](README.md#run).
+The whole command we run (draft model): [README](README.md#run).
 
 ## Turning everything off
 
@@ -104,7 +104,7 @@ turns on F8 alone).
 | `LLAMA_DFLASH_ADAPTIVE`<br>（預設開） | 0012 | `1`、`2`、`0` | DFlash2 依照持續更新的接受率估計，為每個序列各自選草稿寬度（1 到 `--spec-draft-n-max`）；輸出不變。`2` 另外記錄寬度變化，以及每個請求在各寬度的驗證次數。`0`：固定寬度。成本模型用 `LLAMA_DFLASH_ADAPTIVE_COST`（`0.035`）與 `LLAMA_DFLASH_ADAPTIVE_JUMP`（`0.08`）設定。 |
 | `GGML_CUDA_GDN_NT`<br>（預設開） | 0013 | `1`、`0` | Gated DeltaNet 的驗證 kernel（qwen35／qwen35moe 的草稿驗證）讀遞迴狀態、寫每個 token 的快照時用 non-temporal 提示，不把接下來矩陣乘的權重擠出快取。數值相同。 |
 | `LLAMA_RS_ANCHOR`<br>（預設開） | 0013 v3 | `1`、`0` | qwen35／qwen35moe 搭配草稿時：每個 slot 只留兩個遞迴狀態平面（上一批之後的狀態、該批開始時的狀態）和該批每個 token 的重播因子，而不是每個草稿 token 一份完整狀態；草稿只接受一部分時，從開始時的狀態重播。輸出相同；2 slot 約省 1 GiB 顯存（1 slot 約 0.5 GiB），速度略快。所有遞迴層要放在 CPU 或 CUDA／ROCm GPU 上（否則 log 會說它關了）。v3 以前（0013 v2）不設成 `1` 就是關。 |
-| `LLAMA_SPEC_NGRAM_SHADOW`<br>（預設 `24`） | 0014 | 數字；`0` 為關 | 只在模型草稿器前面有 n-gram 類型時作用（`--spec-type ngram-mod,draft-dflash`）。n-gram 草稿先不送出，等它連續猜中模型這麼多個 token 之後，才不經 DFlash2 直接送驗證（最多 `--spec-ngram-mod-n-max` 個），直到猜錯一次為止。`0`：n-gram 草稿一律優先，和上游相同。`LLAMA_SPEC_NGRAM_SHADOW_EXACT=1` 把它截到 7 個 token，greedy 輸出就和沒有 n-gram 類型時相同。 |
+| `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>（預設開） | 選用 0014 | `1`、`0` | 只在用 `ngram-mod` 時作用。每個序列只從本次提示查 n-gram 草稿，用自己的表並核對 key；生成的內容不加進表裡。`0`：上游共用、不核對的表。 |
 | `LLAMA_SPEC_ALIGN`<br>（預設開） | 0015 | `1`、`0` | 只對 hybrid／recurrent 模型：在同一批次裡驗證草稿的序列送出同樣長度的草稿（DFlash2 的自適應寬度往上對齊其他序列，最多到 `--spec-draft-n-max`；較長的草稿截到最短的長度），驗證批次就不會被拆成多個 ubatch。r154 起 rdna-boosts 也用同一個變數控制它自己對 `draft-mtp-adaptive` 的對齊：設 `0` 兩者都關；`GGML_LF_ALL=0` 且沒設這個變數時，我們的關、原版的照舊開。 |
 | `LLAMA_SPEC_ALIGN_CUT`<br>（預設開） | 0015 v2 | `1`、`0` | 把同一輪的草稿截到最短的長度，以及它所依賴的「DFlash2 寬度往上對齊其他草稿器已出的草稿」。`0`：長度不同的草稿交給 ubatch 拆分處理，和原版相同（rdna-boosts 量到：n-gram 草稿因內容而短時，截短是損失；這裡截掉的是兩個上限造成的不等長，照抄 slot 的 15 個 token n-gram 草稿對上 DFlash2 的區塊）。 |
 
@@ -116,10 +116,10 @@ turns on F8 alone).
 |---|---|
 | `-ub 2048 -b 2048` | K1 在大批次（2048）最快；小權重至少要 1024 token。主模型的計算暫存區每個 ubatch token 約 1.1 MiB：長上下文放不下時可以降低（例如 1536）。 |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 只在 flash attention＋q8_0 KV 快取上作用。 |
-| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8` | 只有 0014 需要：n-gram 類型放在 DFlash2 前面。沒有它，0014 不會作用。 |
+| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` | 只有選用的 0014 需要：n-gram 類型放在 DFlash2 前面。沒有它，0014 不會作用。 |
 | `--spec-draft-sampling probabilistic` | 只有 0007 需要。llama.cpp 自己的參數：草稿改為抽樣，以拒絕取樣驗證（無損）。溫度 0.7～1.0 的寫程式／數學變快，低溫時可能變慢：請用自己的工作負載實測。 |
 
-我們實際使用的完整指令（草稿模型、n-gram 草稿）：見 [README](README.md#run)。`--spec-type`、`--spec-ngram-mod-n-max`／`-n-min` 都是上游 llama.cpp 的參數（預設 64／48）；rdna-boosts 會把長度夾到 15、最短也跟著變 15，不設的話只會用到剛好 15 個 token 的 n-gram 草稿，所以我們設最短 8。DFlash2 草稿模型只適用 Qwen3.8-27B（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，Q4_K_M）。Windows 打包版附 `run-server-sample.ps1`，只要填模型路徑。
+我們實際使用的完整指令（草稿模型）：見 [README](README.md#run)。`--spec-type`、`--spec-ngram-mod-n-max`／`-n-min` 都是上游 llama.cpp 的參數（預設 64／48）；rdna-boosts 會把長度夾到 15、最短也跟著變 15，不設的話只會用到剛好 15 個 token 的 n-gram 草稿，所以我們設最短 8。DFlash2 草稿模型只適用 Qwen3.8-27B（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，Q4_K_M）。Windows 打包版附 `run-server-sample.ps1`，只要填模型路徑。
 
 ## 全部關掉
 

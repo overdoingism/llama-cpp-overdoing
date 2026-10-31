@@ -28,7 +28,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | speed/<br>diff |
 | `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
 | `0013-605-gdn-verify-anchor-v3` | Qwen3.x draft verification keeps two recurrent-state planes, not one per draft token (about 1 GiB less VRAM); a moved cell keeps its rollback snapshots | `LLAMA_RS_ANCHOR`<br>(default on);<br>`GGML_CUDA_GDN_NT`<br>(default on) | speed,<br>fix |
-| `optional/0014-605-ngram-shadow-v1b` | n-gram drafts only while the text is being copied | `LLAMA_SPEC_NGRAM_SHADOW`<br>(default on, with `ngram-mod`) | speed/<br>diff |
+| `optional/0014-605-ngram-prompt-only-v2` | n-gram drafts from the current prompt only, with a key check: for rewriting whole files | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>(default on, with `ngram-mod`) | speed/<br>trade-off |
 | `0015-605-spec-align-v3` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
 
 <sub>0010, 0011 (Temporarily)</sub>
@@ -137,7 +137,7 @@ without `HSA_USERPTR_FOR_PAGED_MEM` and with `--poll 0`):
 HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 131072 --kv-unified \
   -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 \
   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf -ngld 99 --spec-draft-n-max 5 \
-  --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8 \
+  --spec-type draft-dflash \
   --spec-draft-sampling probabilistic
 ```
 
@@ -146,10 +146,10 @@ HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 9
 - `-md ... -ngld 99 --spec-draft-n-max 5`: the DFlash2 draft model, for Qwen3.8-27B only
   ([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), Q4_K_M).  With any other
   model leave out the last three lines.
-- `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8`: upstream's n-gram drafts
-  ahead of DFlash2; with `0014` they are used only while the reply copies text it has seen (rewriting a whole file, for
-  example).  The parameters are upstream's (defaults 64 / 48); rdna-boosts clamps the length to 15 and the minimum with
-  it, so without them only 15-token n-gram drafts are kept.
+- `--spec-type draft-dflash`: DFlash2 alone.  To rewrite whole files faster, apply `optional/0014` and use
+  `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` instead: whole-file edits +33..+66 %, other requests
+  about the same, one long English continuation -4 % (Qwen3.8-27B, one request at a time).  The parameters are upstream's;
+  rdna-boosts clamps the length to 15.
 - `--spec-draft-sampling probabilistic`: llama.cpp's own; sampled drafts, verified exactly by rejection sampling (it
   matters at temperature > 0).  `0007` (`LLAMA_SPEC_LENIENCE`, lossy, off by default) builds on it.
 - `HSA_USERPTR_FOR_PAGED_MEM=0`: Linux only ([Switches](#switches)).
