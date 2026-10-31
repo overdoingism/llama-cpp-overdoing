@@ -1,4 +1,4 @@
-From 12acf22640bd85dfe670ac912d56c01754508732 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 14:44:43 +0800
 Subject: [PATCH] GDN verify v3: anchored rollback with replay
@@ -796,10 +796,10 @@ index 2cf0e6f1c..27d9d7e37 100644
  int ggml_cuda_gdn_cache_cpy_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e47c216b0..f01676e2d 100644
+index d2abfe4c8..081c3c194 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4723,6 +4723,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5736,6 +5736,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_GATED_DELTA_NET:
              ggml_cuda_op_gated_delta_net(ctx, dst);
              break;
@@ -809,7 +809,7 @@ index e47c216b0..f01676e2d 100644
          case GGML_OP_DSV4_HC_COMB:
              ggml_cuda_op_dsv4_hc_comb(ctx, dst);
              break;
-@@ -7543,6 +7546,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8755,6 +8758,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return true;
          case GGML_OP_GATED_DELTA_NET:
              return true;
@@ -977,10 +977,10 @@ index dc4883db3..34544bb87 100644
  
  struct ggml_tensor * ggml_lightning_indexer(
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index bf695cc9d..fb0bb95b5 100644
+index 8acbf41e1..619f28ca8 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -469,11 +469,58 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+@@ -482,11 +482,58 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
      }
  }
  
@@ -1039,7 +1039,7 @@ index bf695cc9d..fb0bb95b5 100644
      if (s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
          int32_t * data = (int32_t *) s_copy->data;
-@@ -1268,6 +1315,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1281,6 +1328,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -1049,7 +1049,7 @@ index bf695cc9d..fb0bb95b5 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1315,6 +1365,9 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+@@ -1328,6 +1378,9 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -1059,7 +1059,7 @@ index bf695cc9d..fb0bb95b5 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1388,6 +1441,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+@@ -1401,6 +1454,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -1069,7 +1069,7 @@ index bf695cc9d..fb0bb95b5 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -4052,6 +4108,24 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -4140,6 +4196,24 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
      inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
      inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
  
@@ -1094,7 +1094,7 @@ index bf695cc9d..fb0bb95b5 100644
      inp->head = mctx_cur->get_head();
      inp->rs_z = mctx_cur->get_rs_z();
  
-@@ -4078,9 +4152,26 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -4166,9 +4240,26 @@ ggml_tensor * llm_graph_context::build_rs(
      // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
      ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
  
@@ -1123,7 +1123,7 @@ index bf695cc9d..fb0bb95b5 100644
  
  ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 735380a2a..50b9663aa 100644
+index 8eef59917..f23128237 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -300,6 +300,23 @@ public:
@@ -1835,7 +1835,7 @@ index 9bbd1f4c4..f221eeeb4 100644
  
  struct llm_build_lfm_base : public llm_graph_context {
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 8dc00a6ff..7a6898b3b 100644
+index 927c5e73c..628d2274c 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -396,9 +396,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
@@ -1856,7 +1856,7 @@ index 8dc00a6ff..7a6898b3b 100644
      ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
      cb(conv_output_proper, "conv_output_raw", il);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 3d0d3688e..5c240c2a1 100644
+index 9ac1f47cb..506835abe 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -406,9 +406,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(

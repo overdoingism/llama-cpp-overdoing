@@ -31,7 +31,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 134 insertions(+), 5 deletions(-)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 854b9e589..f37505fde 100644
+index af12a2287..54591b197 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -208,6 +208,41 @@ static bool spec_align_enabled() {
@@ -196,7 +196,7 @@ index 854b9e589..f37505fde 100644
  };
  
  static common_ngram_map get_common_ngram_map(
-@@ -3631,6 +3706,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3635,6 +3710,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          /* .impls       = */ std::move(impls),
          /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
          /* .synth_probs = */ {},
@@ -204,7 +204,7 @@ index 854b9e589..f37505fde 100644
      });
  
      const int32_t n_max_configured = common_speculative_n_max(&params);
-@@ -3720,6 +3796,13 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3724,6 +3800,13 @@ void common_speculative_draft(common_speculative * spec) {
  
      auto & dparams = spec->dparams;
  
@@ -218,7 +218,7 @@ index 854b9e589..f37505fde 100644
      {
          int n_drafting = 0;
  
-@@ -3737,6 +3820,17 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3741,6 +3824,17 @@ void common_speculative_draft(common_speculative * spec) {
      }
  
      for (auto & impl : spec->impls) {
@@ -236,7 +236,7 @@ index 854b9e589..f37505fde 100644
          {
              common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
              impl->draft(dparams);
-@@ -3801,6 +3895,37 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3805,6 +3899,37 @@ void common_speculative_draft(common_speculative * spec) {
              dp.drafting = false;
          }
      }

@@ -1,4 +1,4 @@
-From b3908ca15c6330ae14a970f5019bdc4d454f377b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 19:10:49 +0800
 Subject: [PATCH] ggml-alloc: a GLU may take its gate's memory

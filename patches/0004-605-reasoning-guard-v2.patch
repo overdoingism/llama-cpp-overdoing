@@ -1,4 +1,4 @@
-From a358a7779d4dd54e069ba9bb66bb9d80c9617c54 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 05:40:20 +0800
 Subject: [PATCH] common: reasoning guard v2, on by default

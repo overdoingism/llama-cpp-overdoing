@@ -1,4 +1,4 @@
-From 72fd8ef7981f722920ac59b5c29242a4bb140238 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 12:28:05 +0800
 Subject: [PATCH] ggml-cuda: RDNA4 verify batches of 9..16 query rows run as
@@ -140,10 +140,10 @@ index 855dd929b..995d11b7e 100644
      if (ggml_cuda_lf_fa_fp8_supported(ctx, dst)) {
          ggml_cuda_lf_fa_fp8(ctx, dst);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 10cdf81cc..02099d65a 100644
+index e833d4c35..1ab3320d9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12762,6 +12762,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12765,6 +12765,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

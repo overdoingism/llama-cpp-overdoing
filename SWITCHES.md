@@ -2,11 +2,9 @@
 
 Written with Claude (AI).  Every switch is an environment variable, read once when `llama-server` starts.  **The patches are
 on by default** (the default is under each variable): to turn one off, set it to `0`.  `GGML_LF_ALL=0` makes every switch you leave unset
-default to off; the build then behaves like plain rdna-boosts, apart from the fixes 0005 and 0013.  `0007` is
+default to off; the build then behaves like plain rdna-boosts, apart from 0005 (a faster copy of large states, the same bytes) and the fix in 0013.  `0007` is
 the exception: off unless you ask for it (it is lossy).  Set the variables in the shell that starts the server (`NAME=value` before
 the command in bash, `$env:NAME = "value"` in PowerShell).
-
-(The sets in `patches/r59/`, `patches/r50/` and `patches/a55/` are the older ones: there every switch is off unless set.)
 
 ## Main switches
 
@@ -27,6 +25,8 @@ the command in bash, `$env:NAME = "value"` in PowerShell).
 | `GGML_CUDA_GDN_NT`<br>(default on) | 0013 | `1`, `0` | The Gated DeltaNet verify kernel (qwen35 / qwen35moe, draft verification) reads the recurrent state and writes its per-token snapshots with non-temporal hints, so they do not push the next matmuls' weights out of the cache.  Same values. |
 | `LLAMA_RS_ANCHOR`<br>(default on) | 0013 v3 | `1`, `0` | qwen35 / qwen35moe with drafts: each slot keeps two recurrent-state planes (after its last batch, and the one that batch started from) and the batch's per-token replay factors instead of one full state per draft token; a partly rejected draft is replayed from the start state.  Same output; about 1 GiB less VRAM with 2 slots (0.5 GiB with 1), slightly faster.  Needs every recurrent layer on the CPU or a CUDA / ROCm GPU (otherwise the log says it is off).  Before v3 (0013 v2) it was off unless set to `1`. |
 | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>(default on) | optional 0014 | `1`, `0` | Only with `ngram-mod`.  Each sequence looks up n-gram drafts only in its current prompt, in its own table with a key check; generated tokens are not added.  `0`: upstream's shared table without the check. |
+| `LLAMA_STATE_ASYNC_BANDS`<br>(default on with one device) | 0005 | `1`, `0` | A state above `LLAMA_STATE_ASYNC_MAX_MIB` (256) is copied through the pinned stage one band at a time.  `0`: the per-tensor path.  `1`: forced on, also on several devices, where a `-sm tensor` split may not serve the windows. |
+| `GGML_LF_KQ_BLAS_ADD`<br>(default on) | 0001, 0003 | `1`, `0` | The residual ADD after a matmul K1 or M4 takes goes into the GEMM.  The same output. |
 | `LLAMA_SPEC_ALIGN`<br>(default on) | 0015 | `1`, `0` | Hybrid / recurrent models only: sequences that verify drafts in the same batch send drafts of one length (DFlash2's adaptive width aligns up to the others, up to `--spec-draft-n-max`; a longer draft is cut to the shortest), so the verify batch is not split into ubatches.  From r154 rdna-boosts reads the same variable for its own alignment of `draft-mtp-adaptive`: `0` turns off both; with `GGML_LF_ALL=0` and the variable unset, ours is off and the release's stays on. |
 | `LLAMA_SPEC_ALIGN_CUT`<br>(default on) | 0015 v2 | `1`, `0` | The cut of the drafts of one call to the shortest one, and the raise of DFlash2's width to a draft another drafter already made, which it relies on.  `0`: unequal drafts are left to the ubatch split, as in the release (rdna-boosts measured the cut as a loss where an n-gram draft is short because of its content; here it removes a mismatch of two caps, a copying slot's 15-token n-gram draft next to DFlash2's block). |
 
@@ -84,8 +84,6 @@ turns on F8 alone).
 
 本文件由 Claude（AI）撰寫。所有開關都是環境變數，`llama-server` 啟動時讀一次。**patch 預設都是開的**（預設值寫在每個變數下方）：要關哪一個，就把它設成 `0`。`GGML_LF_ALL=0` 會讓所有沒設的開關預設改成關；這時行為和原版 rdna-boosts 相同，只差 0005 與 0013 的修正。`0007` 是例外：不設就是關（它有損）。在啟動 server 的 shell 裡設定（bash 寫在指令前面 `名稱=值`，PowerShell 用 `$env:名稱 = "值"`）。
 
-（`patches/r59/`、`patches/r50/`、`patches/a55/` 是舊版：那些版本不設就是關。）
-
 ## 主要開關
 
 | 變數 | patch | 值 | 作用 |
@@ -105,6 +103,8 @@ turns on F8 alone).
 | `GGML_CUDA_GDN_NT`<br>（預設開） | 0013 | `1`、`0` | Gated DeltaNet 的驗證 kernel（qwen35／qwen35moe 的草稿驗證）讀遞迴狀態、寫每個 token 的快照時用 non-temporal 提示，不把接下來矩陣乘的權重擠出快取。數值相同。 |
 | `LLAMA_RS_ANCHOR`<br>（預設開） | 0013 v3 | `1`、`0` | qwen35／qwen35moe 搭配草稿時：每個 slot 只留兩個遞迴狀態平面（上一批之後的狀態、該批開始時的狀態）和該批每個 token 的重播因子，而不是每個草稿 token 一份完整狀態；草稿只接受一部分時，從開始時的狀態重播。輸出相同；2 slot 約省 1 GiB 顯存（1 slot 約 0.5 GiB），速度略快。所有遞迴層要放在 CPU 或 CUDA／ROCm GPU 上（否則 log 會說它關了）。v3 以前（0013 v2）不設成 `1` 就是關。 |
 | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>（預設開） | 選用 0014 | `1`、`0` | 只在用 `ngram-mod` 時作用。每個序列只從本次提示查 n-gram 草稿，用自己的表並核對 key；生成的內容不加進表裡。`0`：上游共用、不核對的表。 |
+| `LLAMA_STATE_ASYNC_BANDS`<br>（單一裝置時預設開） | 0005 | `1`、`0` | 超過 `LLAMA_STATE_ASYNC_MAX_MIB`（256）的狀態，分段經鎖定暫存區複製。`0`：逐張量複製。`1`：強制開，多裝置時 `-sm tensor` 可能無法處理這種切法。 |
+| `GGML_LF_KQ_BLAS_ADD`<br>（預設開） | 0001、0003 | `1`、`0` | K1 或 M4 接手的矩陣乘後面的殘差 ADD 併進 GEMM。輸出相同。 |
 | `LLAMA_SPEC_ALIGN`<br>（預設開） | 0015 | `1`、`0` | 只對 hybrid／recurrent 模型：在同一批次裡驗證草稿的序列送出同樣長度的草稿（DFlash2 的自適應寬度往上對齊其他序列，最多到 `--spec-draft-n-max`；較長的草稿截到最短的長度），驗證批次就不會被拆成多個 ubatch。r154 起 rdna-boosts 也用同一個變數控制它自己對 `draft-mtp-adaptive` 的對齊：設 `0` 兩者都關；`GGML_LF_ALL=0` 且沒設這個變數時，我們的關、原版的照舊開。 |
 | `LLAMA_SPEC_ALIGN_CUT`<br>（預設開） | 0015 v2 | `1`、`0` | 把同一輪的草稿截到最短的長度，以及它所依賴的「DFlash2 寬度往上對齊其他草稿器已出的草稿」。`0`：長度不同的草稿交給 ubatch 拆分處理，和原版相同（rdna-boosts 量到：n-gram 草稿因內容而短時，截短是損失；這裡截掉的是兩個上限造成的不等長，照抄 slot 的 15 個 token n-gram 草稿對上 DFlash2 的區塊）。 |
 

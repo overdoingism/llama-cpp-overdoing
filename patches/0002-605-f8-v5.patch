@@ -1,4 +1,4 @@
-From e836a79f96a721d21b095392e0ce90b5f676e850 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 05:40:20 +0800
 Subject: [PATCH] F8 v5: flash-attention prefill in fp8, on by default; the row
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cuh
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index eae6ada60..63f4f94f2 100644
+index 9359bcf78..9e1455187 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1676,9 +1676,32 @@ void   ggml_cuda_h2d_ring_cap_set(size_t bytes);
+@@ -1728,9 +1728,32 @@ void   ggml_cuda_h2d_ring_cap_set(size_t bytes);
  // The per-operand cap GGML_CUDA_FA_STAGE_MAX_MB resolves to (0 = unbounded): a staging request
  // larger than this is not staged at all.  Shared by launch_fattn and the --fit accounting of the
  // staging arena (ggml_backend_cuda_fattn_stage_bound).

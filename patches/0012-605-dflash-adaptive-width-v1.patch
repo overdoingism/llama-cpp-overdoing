@@ -1,4 +1,4 @@
-From ac86ec1d183db4df955009adc9d8c63c144f008a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 16:10:57 +0800
 Subject: [PATCH] speculative: DFlash2 adaptive verify width, on by default
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 190 insertions(+), 3 deletions(-)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 9ba62b4f2..492cc3e0a 100644
+index f4fa4106c..af12a2287 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -14,6 +14,7 @@
@@ -32,7 +32,7 @@ index 9ba62b4f2..492cc3e0a 100644
  #include <cassert>
  #include <cmath>
  #include <cstring>
-@@ -1048,6 +1049,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1081,6 +1082,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
      // (A LLAMA_SWA_TYPE_CHUNKED window reaches back to the chunk start -- up to 2*n_swa-1 -- and would need a wider tail.)
      int32_t                ingest_window = 0;
      std::vector<llama_pos> ingest_from;
@@ -66,7 +66,7 @@ index 9ba62b4f2..492cc3e0a 100644
  
      const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
      uint32_t        target_layer_ids_n = 0;
-@@ -1113,6 +1141,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1146,6 +1174,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              ingest_from.assign(n_seq, 0);
          }
  
@@ -88,7 +88,7 @@ index 9ba62b4f2..492cc3e0a 100644
          if (is_dspark && this->params.p_min > 0.0f) {
              char buf[16] = {};
              const bool has_conf =
-@@ -1143,6 +1186,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1176,6 +1219,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -104,7 +104,7 @@ index 9ba62b4f2..492cc3e0a 100644
          batch        = common_batch(ctx_dft);
          batch_inject = common_batch(ctx_dft);
  
-@@ -1233,6 +1285,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1266,6 +1318,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          // reseed per request rather than per round, or two identical requests differ
          dflash2_seed[seq_id] = -1;
  
@@ -123,7 +123,7 @@ index 9ba62b4f2..492cc3e0a 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1436,6 +1500,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1469,6 +1533,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          std::vector<int32_t> i_block_beg(n_seq, -1);
          std::vector<int32_t> n_block    (n_seq,  0);
  
@@ -146,7 +146,7 @@ index 9ba62b4f2..492cc3e0a 100644
          for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
              auto & dp = dparams[seq_id];
              if (!dp.drafting) {
-@@ -1444,9 +1524,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1477,9 +1557,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
  
              common_sampler_reset(smpls[seq_id].get());
  
@@ -169,7 +169,7 @@ index 9ba62b4f2..492cc3e0a 100644
              const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
              i_block_beg[seq_id] = batch.size();
              n_block    [seq_id] = n_block_tokens;
-@@ -1555,6 +1647,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1588,6 +1680,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                      result.push_back((llama_token) row[predecessor]);
                  }
  
@@ -188,7 +188,7 @@ index 9ba62b4f2..492cc3e0a 100644
                  if (result.size() < (size_t) params.n_min) {
                      result.clear();
                      if (sample) {
-@@ -1623,8 +1727,91 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1656,8 +1760,91 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
          }
      }
  

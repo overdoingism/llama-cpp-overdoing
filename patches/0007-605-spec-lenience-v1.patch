@@ -1,4 +1,4 @@
-From 655efa4cb3b5239e7e5031178845cfb9d5d35778 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 05:40:20 +0800
 Subject: [PATCH] speculative: the lenience of rejection-sampling verification
@@ -126,10 +126,10 @@ index f19bd27c4..8bec28fa9 100644
  std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 936d718e4..51492cd37 100644
+index e64cdc95f..bd6964377 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -771,6 +771,14 @@ struct server_slot {
+@@ -781,6 +781,14 @@ struct server_slot {
                  "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                  llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
  

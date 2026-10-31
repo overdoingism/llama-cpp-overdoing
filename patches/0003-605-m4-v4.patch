@@ -1,5 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 05:40:20 +0800
+Subject: [PATCH] M4 v4: MXFP4 weights converted exactly to fp8 for K1's fp8
+ GEMM, on by default (needs 0001)
+
+v4 = v3 with the residual ADD in its fp8 GEMM, as K1 (off with GGML_LF_KQ_BLAS_ADD=0), and one row per block for the RMS norm with
+the channel amax (K1 too).  The same logits; MXFP4 pp2048 +2.5 %, at depth 32768 +2.0 %.
+
+v3 = v2 with the switch on by default: GGML_LF_MXFP4_DIRECT unset means blaslt (0 turns it off; GGML_LF_ALL=0 makes it
+default to off).
+
+r59 port (rdna-boosts V2.0 layout, r51+): the fusion stand-downs in mmq.cu also cover the matmuls M4 takes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu   |   9 +-
+ ggml/src/ggml-cuda/lf-kq-blas.cu  |  19 +-
+ ggml/src/ggml-cuda/lf-kq-blas.cuh |   4 +-
+ ggml/src/ggml-cuda/lf-mxfp4.cu    | 795 ++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/lf-mxfp4.cuh   |  25 +
+ ggml/src/ggml-cuda/mmq.cu         |   5 +-
+ ggml/src/ggml-cuda/norm.cu        |  73 ++-
+ 7 files changed, 878 insertions(+), 52 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/lf-mxfp4.cu
+ create mode 100644 ggml/src/ggml-cuda/lf-mxfp4.cuh
+
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6f68b7895..db68916d9 100644
+index 81dbf46b6..ac508998f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -21,6 +21,7 @@
@@ -10,7 +37,7 @@ index 6f68b7895..db68916d9 100644
  #include "ggml-cuda/count-equal.cuh"
  #include "ggml-cuda/cpy.cuh"
  #include "ggml-cuda/cross-entropy-loss.cuh"
-@@ -2341,7 +2342,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -4947,7 +4948,7 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
      }
  
      // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes these matmuls unfused
@@ -19,7 +46,7 @@ index 6f68b7895..db68916d9 100644
          return false;
      }
  
-@@ -2534,6 +2535,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -5072,6 +5073,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          ggml_cuda_lf_kq_blas_mul_mat(ctx, src0, src1, dst);
          return;
      }
@@ -31,38 +58,99 @@ index 6f68b7895..db68916d9 100644
  
      // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
      // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
-@@ -4885,7 +4891,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-             ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
-             : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
-     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes dense pairs unfused
--    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && ggml_cuda_lf_kq_blas_will_take(node);
-+    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && (ggml_cuda_lf_kq_blas_will_take(node) || ggml_cuda_lf_mxfp4_will_take(node));
-     if (!pair_off && !mmb_pair_taken && !lf_kq_pair_taken && (node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) && i + 1 < cgraph->n_nodes) {
-         ggml_tensor * next = cgraph->nodes[i + 1];
-         const ggml_tensor * src0 = node->src[0];
-@@ -5112,7 +5118,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-             node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
-             a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
-         // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes the down projection unfused
--        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) &&
-+        if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) && !ggml_cuda_lf_mxfp4_will_take(next) &&
-                 ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
-                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
-             ggml_cuda_mul_mat_q_swiglu_dense(*cuda_ctx, next->src[0], next, node);
-@@ -7217,6 +7223,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
-     // The Q8_1 input cache is only valid within one graph execution.
-     cuda_ctx->q8_1_cache_clear();
+@@ -6965,6 +6971,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     cuda_ctx->mwr_done_graph = nullptr;
+     cuda_ctx->bf16_src1_cache_clear();
      ggml_cuda_lf_kq_blas_graph_begin();
 +    ggml_cuda_lf_mxfp4_graph_begin();
      ggml_cuda_mmb_set_active_ctx(cuda_ctx);
      ggml_cuda_mmb_begin_graph();
  
+diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cu b/ggml/src/ggml-cuda/lf-kq-blas.cu
+index a9d877050..0f3bd236b 100644
+--- a/ggml/src/ggml-cuda/lf-kq-blas.cu
++++ b/ggml/src/ggml-cuda/lf-kq-blas.cu
+@@ -1,4 +1,5 @@
+ #include "lf-kq-blas.cuh"
++#include "lf-mxfp4.cuh"
+ #include "convert.cuh"
+ #include "dequantize.cuh"
+ 
+@@ -1309,14 +1310,14 @@ bool ggml_cuda_lf_fp8_gemm_ready(const int M, const int T, const int K) {
+ }
+ 
+ void ggml_cuda_lf_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const float * av, const uint8_t * w8, float * y,
+-        const int M, const int T, const int K) {
++        const int M, const int T, const int K, const float * c) {
+ #if defined(GGML_LF_HIPBLASLT)
+     lf_blt_state & st = lf_blt();
+     std::lock_guard<std::mutex> lock(st.mutex);
+     if (!st.handle) LF_BLT_CHECK(hipblasLtCreate(&st.handle));
+-    lf_blt_gemm(ctx, st, src1, av, w8, (const float *) src1->data, y, M, T, K);
++    lf_blt_gemm(ctx, st, src1, av, w8, (const float *) src1->data, y, M, T, K, c);
+ #else
+-    GGML_UNUSED_VARS(ctx, src1, av, w8, y, M, T, K);
++    GGML_UNUSED_VARS(ctx, src1, av, w8, y, M, T, K, c);
+     GGML_ABORT("the fp8 GEMM needs hipBLASLt");
+ #endif // defined(GGML_LF_HIPBLASLT)
+ }
+@@ -1594,20 +1595,24 @@ bool ggml_cuda_lf_kq_blas_supported(ggml_backend_cuda_context & ctx, const ggml_
+ bool ggml_cuda_lf_kq8_mul_mat_add(ggml_backend_cuda_context & ctx, ggml_tensor * mm, ggml_tensor * add) {
+ #if defined(GGML_LF_HIPBLASLT)
+     static const bool on = !getenv("GGML_LF_KQ_BLAS_ADD") || atoi(getenv("GGML_LF_KQ_BLAS_ADD")) != 0;
+-    if (!on || lf_kq_mode() != 2 || lf_blt_algo_mode() == 2) return false;
++    if (!on || lf_blt_algo_mode() == 2) return false;
+     const ggml_tensor * src0 = mm->src[0], * src1 = mm->src[1];
+     const ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[0];
+     if (other == nullptr || other == mm || add->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+         !ggml_is_contiguous(add) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mm) ||
+-        !ggml_are_same_shape(add, mm) || !ggml_are_same_shape(other, mm) || !ggml_cuda_lf_kq_blas_supported(ctx, src0, src1, mm)) {
++        !ggml_are_same_shape(add, mm) || !ggml_are_same_shape(other, mm)) {
+         return false;
+     }
+     // the GEMM reads c while it writes d element by element: the same buffer, or apart
+     const char * c = (const char *) other->data, * d = (const char *) add->data;
+     const size_t n = ggml_nbytes(add);
+     if (c != d && c < d + n && d < c + n) return false;
+-    ggml_cuda_lf_kq_fp8_mul_mat(ctx, src0, src1, mm, (float *) add->data, (const float *) other->data);
+-    return true;
++    if (lf_kq_mode() == 2 && ggml_cuda_lf_kq_blas_supported(ctx, src0, src1, mm)) {
++        ggml_cuda_lf_kq_fp8_mul_mat(ctx, src0, src1, mm, (float *) add->data, (const float *) other->data);
++        return true;
++    }
++    // M4 (MXFP4 weights) in its blaslt mode: the same GEMM
++    return ggml_cuda_lf_mxfp4_mul_mat_add(ctx, src0, src1, mm, (float *) add->data, (const float *) other->data);
+ #else
+     GGML_UNUSED_VARS(ctx, mm, add);
+     return false;
+diff --git a/ggml/src/ggml-cuda/lf-kq-blas.cuh b/ggml/src/ggml-cuda/lf-kq-blas.cuh
+index 58c5562e2..25526f83e 100644
+--- a/ggml/src/ggml-cuda/lf-kq-blas.cuh
++++ b/ggml/src/ggml-cuda/lf-kq-blas.cuh
+@@ -14,7 +14,7 @@
+ // at -ub 2048.  Decode and speculative verify (<= 8 tokens) never reach it.
+ bool ggml_cuda_lf_kq_blas_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ void ggml_cuda_lf_kq_blas_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+-// K1 fp8: a matmul this path takes whose only reader is the next node, an ADD of the same shape (the residual): one GEMM,
++// K1 fp8 (or M4 in its blaslt mode): a matmul this path takes whose only reader is the next node, an ADD of the same shape (the residual): one GEMM,
+ // beta 1, C = the ADD's other input, D = the ADD's output (false: not taken, run both nodes).  hipBLASLt adds C to the rounded
+ // alpha * product, so D is the plain path's fl(product + C) bit for bit (tools/k1probe/k8beta: every gfx1201 fp8 candidate,
+ // 384..2048 tokens).  GGML_LF_KQ_BLAS_ADD=0: off.
+@@ -37,7 +37,7 @@ int          ggml_cuda_lf_kq_blas_fp8_shapes();
+ //   y[M][T] = av[m] * sx * (w8[m] . xq[t]), w8 fp8 [M][K] row-major, the fp8 activations converted from src1 once per input and graph
+ bool ggml_cuda_lf_fp8_gemm_ready(int M, int T, int K);
+ void ggml_cuda_lf_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const float * av, const uint8_t * w8, float * y,
+-                           int M, int T, int K);
++                           int M, int T, int K, const float * c = nullptr);
+ 
+ // v3.3: the channel amax of the KEEP path folded into the kernel that writes the activation (a GLU, a gated unary fused with
+ // its MUL, or an RMS_NORM fused with its MUL), instead of a pass of its own over the activation.  ggml_cuda_try_fuse calls ggml_cuda_lf_kq8_amax_mark for every
 diff --git a/ggml/src/ggml-cuda/lf-mxfp4.cu b/ggml/src/ggml-cuda/lf-mxfp4.cu
 new file mode 100644
-index 000000000..29a8c9963
+index 000000000..9eae97f0b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-mxfp4.cu
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,795 @@
 +#include "lf-mxfp4.cuh"
 +#include "lf-kq-blas.cuh"
 +#include "convert.cuh"
@@ -101,10 +189,19 @@ index 000000000..29a8c9963
 +constexpr int LF_SHIFT8  = 133;
 +constexpr int LF_SHIFT16 = 140;
 +
-+int lf_mode() { // 0 off, 1 fp8, 2 f16, 3 blaslt (MXFP4 -> fp8 copy + hipBLASLt fp8 GEMM)
++int lf_mode() { // 0 off, 1 fp8, 2 f16, 3 blaslt (MXFP4 -> fp8 copy + hipBLASLt fp8 GEMM); unset: blaslt (GGML_LF_ALL=0: off)
 +    static const int mode = [] {
 +        const char * s = getenv("GGML_LF_MXFP4_DIRECT");
-+        if (s == nullptr) return 0;
++        if (s == nullptr) {
++            const char * a = getenv("GGML_LF_ALL");
++            if (a != nullptr && a[0] == '0' && a[1] == '\0') return 0;
++#if defined(GGML_LF_HIPBLASLT)
++            return 3;
++#else
++            return 0;
++#endif // defined(GGML_LF_HIPBLASLT)
++        }
++        if (strcmp(s, "0") == 0) return 0;
 +        if (strcmp(s, "fp8") == 0) return 1;
 +        if (strcmp(s, "f16") == 0) return 2;
 +#if defined(GGML_LF_HIPBLASLT)
@@ -684,7 +781,7 @@ index 000000000..29a8c9963
 +}
 +
 +void lf_blt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const uint8_t * emax,
-+        const float * x, float * y, const int M, const int T, const int K) {
++        const float * x, float * y, const int M, const int T, const int K, const float * c = nullptr) {
 +    cudaStream_t stream = ctx.stream();
 +    lf_m4_state & st = lf_m4();
 +    std::lock_guard<std::mutex> lock(st.mutex);
@@ -711,7 +808,7 @@ index 000000000..29a8c9963
 +        lf_mxfp4_to_fp8_flat<<<(unsigned) ((nall + 255) / 256), 256, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], K / LF_QK,
 +                                                                                    emax, w8.get(), K, nall);
 +    }
-+    ggml_cuda_lf_fp8_gemm(ctx, src1, av, w8.get(), y, M, T, K);
++    ggml_cuda_lf_fp8_gemm(ctx, src1, av, w8.get(), y, M, T, K, c);
 +    GGML_UNUSED(x);
 +}
 +
@@ -831,15 +928,30 @@ index 000000000..29a8c9963
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
++bool ggml_cuda_lf_mxfp4_mul_mat_add(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
++        float * y, const float * c) {
++#if defined(GGML_LF_HIPBLASLT)
++    if (lf_mode() != 3 || !ggml_cuda_lf_mxfp4_supported(ctx, src0, src1, dst)) return false;
++    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
++    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    lf_blt_mul_mat(ctx, src0, src1, lf_emax_get(ctx, src0), (const float *) src1->data, y, M, T, K, c);
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++#else
++    GGML_UNUSED_VARS(ctx, src0, src1, dst, y, c);
++    return false;
++#endif // defined(GGML_LF_HIPBLASLT)
++}
++
 +void ggml_cuda_lf_mxfp4_graph_begin() {
 +    // the shared fp8 activations live in K1 (lf-kq-blas.cu); ggml_cuda_lf_kq_blas_graph_begin() expires them
 +}
 diff --git a/ggml/src/ggml-cuda/lf-mxfp4.cuh b/ggml/src/ggml-cuda/lf-mxfp4.cuh
 new file mode 100644
-index 000000000..4f8d04945
+index 000000000..c5324822e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-mxfp4.cuh
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,25 @@
 +#pragma once
 +#include "common.cuh"
 +// Llama-Frankenstein: MXFP4 "direct path" GEMM for RDNA4 prefill (written by Claude).
@@ -857,7 +969,152 @@ index 000000000..4f8d04945
 +// mmq (int8 per-32 activations).
 +bool ggml_cuda_lf_mxfp4_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 +void ggml_cuda_lf_mxfp4_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++// blaslt mode: the product of a matmul this path takes written to y with c added (beta 1; the residual ADD folded into the GEMM,
++// see ggml_cuda_lf_kq8_mul_mat_add); false: not taken (another mode, or not supported)
++bool ggml_cuda_lf_mxfp4_mul_mat_add(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
++                                    float * y, const float * c);
 +// start of a graph: the fp8 activations shared by the MUL_MATs of one graph are invalid from here on
 +void ggml_cuda_lf_mxfp4_graph_begin();
 +// the fusions that would take an MXFP4 prefill matmul (dense gate+up pair, swiglu -> mmq down) stand down for this path
 +bool ggml_cuda_lf_mxfp4_will_take(const ggml_tensor * mm);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 95a6fe822..6bc6b3fdc 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -5,6 +5,7 @@
+ #include "quantize.cuh"
+ #include "mmid.cuh"
+ #include "lf-kq-blas.cuh"   // Llama-Frankenstein K1
++#include "lf-mxfp4.cuh"     // Llama-Frankenstein M4
+ 
+ #include <cstdint>
+ 
+@@ -942,7 +943,7 @@ int ggml_cuda_mul_mat_q_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggm
+                ggml_cuda_mmb_supported_mm(node->src[0], node->src[1], node) &&
+                ggml_cuda_mmb_supported_mm(node_next->src[0], node_next->src[1], node_next)));
+     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes dense pairs unfused
+-    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && ggml_cuda_lf_kq_blas_will_take(node);
++    const bool lf_kq_pair_taken = node->op == GGML_OP_MUL_MAT && (ggml_cuda_lf_kq_blas_will_take(node) || ggml_cuda_lf_mxfp4_will_take(node));
+     if (pair_off || mmb_pair_taken || lf_kq_pair_taken ||
+             !(node->op == GGML_OP_MUL_MAT_ID ? !disable_pair_routed : (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) ||
+             i + 1 >= cgraph->n_nodes) {
+@@ -1056,7 +1057,7 @@ int ggml_cuda_mul_mat_q_swiglu_dense_try_fuse(ggml_backend_cuda_context & ctx, c
+         node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
+         a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
+     // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes the down projection unfused
+-    if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) &&
++    if (shape_ok && ggml_is_quantized(next->src[0]->type) && !ggml_cuda_lf_kq_blas_will_take(next) && !ggml_cuda_lf_mxfp4_will_take(next) &&
+             ggml_cuda_mul_mat_takes_mmq(ctx, next->src[0], node, next) &&
+             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+         ggml_cuda_mul_mat_q_swiglu_dense(ctx, next->src[0], next, node);
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index a721b60d3..49933fa63 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -266,59 +266,54 @@ static __global__ void rms_norm_f32(const float * x,
+ }
+ 
+ // K1 fp8 KEEP: an RMS_NORM * MUL (one weight row) whose output is a K1 matmul's activation (ggml_cuda_lf_kq8_amax_take).
+-// rms_norm_f32<block_size, 1, false, true>'s rows -- the same per-thread sums, the same block reduction, the same
+-// `scale * x * mul`, so the same bits -- for nr rows per block; each thread also keeps the absolute maximum of its ncols /
+-// block_size columns and folds it into the channel amax once per block (skipped when the buffer already holds as much: it only
+-// grows, so a stale read can only cost an atomic).  The matmul then skips its own pass over the activation.
++// rms_norm_f32<block_size, 1, false, true>'s row -- the same per-thread sum in the same column order, the same block reduction,
++// the same `scale * x * mul`, so the same bits -- one row per block like it, with x and the weight row held in registers; each
++// thread then folds the absolute values of its ncols / block_size columns into the channel amax, skipping the atomic where the
++// buffer already holds as much (it only grows, so a stale read can only cost an atomic; NaN never counts, as with fmaxf).  The
++// matmul then skips its own pass over the activation.  (Per-block maxima over several rows measured slower: 2 rows +3%, 8 +8%.)
+ template <int block_size, int max_cpt>
+-static __global__ void rms_norm_mul_chan_amax_f32(const float * x, float * dst, const int ncols, const int nrows, const int nr,
+-        const int64_t stride_row, const float eps, const float * mul, unsigned int * cbits) {
++static __global__ void rms_norm_mul_chan_amax_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
++        const float eps, const float * mul, unsigned int * cbits) {
++    const int row = blockIdx.x;
+     const int tid = threadIdx.x;
+ 
+     extern __shared__ float s_sum[];
+ 
+-    float a[max_cpt];
++    const float * xc   = x   + row*stride_row;
++    float       * dstc = dst + (int64_t) row*ncols;
++    float xv[max_cpt], m[max_cpt];
+ #pragma unroll
+     for (int k = 0; k < max_cpt; ++k) {
+-        a[k] = 0.0f;
++        const int col = tid + k*block_size;
++        xv[k] = col < ncols ? xc[col]  : 0.0f;
++        m[k]  = col < ncols ? mul[col] : 0.0f;
+     }
+-    const int r0 = blockIdx.x*nr;
+-    const int r1 = r0 + nr < nrows ? r0 + nr : nrows;
+-    for (int row = r0; row < r1; ++row) {
+-        const float * xc   = x   + row*stride_row;
+-        float       * dstc = dst + (int64_t) row*ncols;
+ 
+-        float tmp = 0.0f; // partial sum for thread in warp
++    float tmp = 0.0f; // partial sum for thread in warp
+ 
+-        for (int col = tid; col < ncols; col += block_size) {
+-            const float xi = xc[col];
+-            tmp += xi * xi;
++#pragma unroll
++    for (int k = 0; k < max_cpt; ++k) {
++        if (tid + k*block_size < ncols) {
++            tmp += xv[k] * xv[k];
+         }
++    }
+ 
+-        // sum up partial sums
+-        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+-
+-        const float mean = tmp / ncols;
+-        const float scale = rsqrtf(mean + eps);
++    // sum up partial sums
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+ 
+-#pragma unroll
+-        for (int k = 0; k < max_cpt; ++k) {
+-            const int col = tid + k*block_size;
+-            if (col < ncols) {
+-                const float v = scale * xc[col] * mul[col];
+-                dstc[col] = v;
+-                a[k] = fmaxf(a[k], fabsf(v));
+-            }
+-        }
++    const float mean = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
+ 
+-        // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
+-        __syncthreads();
+-    }
+ #pragma unroll
+     for (int k = 0; k < max_cpt; ++k) {
+         const int col = tid + k*block_size;
+-        if (col < ncols && __float_as_uint(a[k]) > cbits[col]) {
+-            atomicMax(cbits + col, __float_as_uint(a[k]));
++        if (col < ncols) {
++            const float v = scale * xv[k] * m[k];
++            dstc[col] = v;
++            const unsigned int a = __float_as_uint(fmaxf(0.0f, fabsf(v)));
++            if (a > cbits[col]) {
++                atomicMax(cbits + col, a);
++            }
+         }
+     }
+ }
+@@ -1193,10 +1188,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+         if (unsigned int * cbits = ggml_cuda_lf_kq8_amax_take(ctx, mul_tensor, &kc)) {
+             GGML_ASSERT(kc == ne00);
+             const int nrows = (int) (ne01*ne02*ne03);
+-            // about 256 blocks: whole waves of 1024-thread blocks and few atomics per channel
+-            const int nr = std::max(1, std::min(64, nrows / 256));
+-            rms_norm_mul_chan_amax_f32<1024, amax_cpt><<<(nrows + nr - 1) / nr, 1024, 32 * sizeof(float), stream>>>(
+-                (const float *) rms_norm_src->data, dst_d, (int) ne00, nrows, nr, s01, eps, (const float *) mul_src->data, cbits);
++            rms_norm_mul_chan_amax_f32<1024, amax_cpt><<<nrows, 1024, 32 * sizeof(float), stream>>>(
++                (const float *) rms_norm_src->data, dst_d, (int) ne00, s01, eps, (const float *) mul_src->data, cbits);
+             return;
+         }
+     }
+-- 
+2.43.0
+

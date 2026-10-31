@@ -117,7 +117,7 @@ index 7af92e9dd..3d2958613 100644
 +    uint64_t hash(const entry_t * tokens) const;
  };
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index f37505fde..4bd0698d5 100644
+index 54591b197..b0a46d8c4 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -2728,12 +2728,32 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {

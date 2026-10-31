@@ -1,4 +1,4 @@
-From b361f9dafeba1fffedd871323a45d79d6ce76b93 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 05:40:20 +0800
 Subject: [PATCH] ggml-cuda: mmvk v3, K-quant decode / verify matmul with the
@@ -35,7 +35,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 ggml/src/ggml-cuda/mmvk.cuh
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index fd18717ad..7d3370473 100644
+index 82c30c2be..2fff7b587 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -87,6 +87,7 @@
@@ -46,7 +46,7 @@ index fd18717ad..7d3370473 100644
  #include "ggml.h"
  #include <algorithm>
  #include <numeric>
-@@ -1686,6 +1687,14 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -1963,6 +1964,14 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -62,7 +62,7 @@ index fd18717ad..7d3370473 100644
      if (const int n_hc_combine_mix = ggml_cuda_hc_combine_mix_try_fuse(*cuda_ctx, cgraph, i)) {
          return n_hc_combine_mix;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index ad10ec952..6599dba9a 100644
+index ac508998f..d2abfe4c8 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -21,6 +21,7 @@
@@ -73,7 +73,7 @@ index ad10ec952..6599dba9a 100644
  #include "ggml-cuda/lf-mxfp4.cuh"     // Llama-Frankenstein M4
  #include "ggml-cuda/count-equal.cuh"
  #include "ggml-cuda/cpy.cuh"
-@@ -4065,6 +4066,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -5078,6 +5079,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          ggml_cuda_lf_mxfp4_mul_mat(ctx, src0, src1, dst);
          return;
      }
@@ -85,7 +85,7 @@ index ad10ec952..6599dba9a 100644
  
      // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
      // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
-@@ -6006,6 +6012,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7179,6 +7185,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      const bool marks_only  = params != nullptr && params->marks_only;
      const bool allocs_only = params != nullptr && params->allocs_only;
  
@@ -102,7 +102,7 @@ index ad10ec952..6599dba9a 100644
      if (!allocs_only) {
      // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
      // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
-@@ -7939,6 +7955,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9273,6 +9289,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -557,16 +557,17 @@ index 000000000..641058983
 +// GGML_CUDA_MMVK is unset)
 +const char * ggml_cuda_mmvk_set_speculative(bool on);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index fb25cd899..1351db9b5 100644
+index 30b1836fc..8e5c2a749 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  #include "mmvq.cuh"
+ #include "gdn-conv.cuh"
 +#include "mmvk.cuh"
  #include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
  #include "quantize.cuh"
  #include "unary.cuh"
-@@ -2949,6 +2950,12 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
+@@ -3014,6 +3015,12 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
      bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                               dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  
@@ -580,10 +581,10 @@ index fb25cd899..1351db9b5 100644
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
      if (cc <= GGML_CUDA_CC_PASCAL) {
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index bc79a3031..936d718e4 100644
+index d6aa3c909..e64cdc95f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1247,6 +1247,22 @@ private:
+@@ -1389,6 +1389,22 @@ private:
          const bool spec_mtp = params_base.speculative.has_mtp();
          const bool has_spec = has_draft || spec_mtp;
  

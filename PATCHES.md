@@ -1,18 +1,17 @@
 # Patches in detail
 
 What each patch in [`patches/`](patches) does, its switch (with the default under it), and what it needs; then the change log.
-[`patches/r144/`](patches/r144) holds `0015` v1 (for r144 to r153); on Windows use r147 or later (r143 to r146 do not compile
-there, rdna-boosts issue #231).  The short table is in
+The short table is in
 the [README](README.md#patches).  Written with Claude (AI).
 
 | patch | what | switch | type | needs |
 |---|---|---|---|---|
-| `0001-605-k1-v6` | prefill matmuls of K-quant weights through hipBLASLt in fp8 (or f16); fp8 corrects the largest activation channels.  v6 = v4 also taking batches of 384..1023 tokens on weights of 20M elements or more (a prompt's last batch, short prompts, the draft's batches), and converting Q4_K / Q5_K / IQ4_XS weights without the LDS round trip (same bytes, faster) | `GGML_LF_KQ_BLAS`<br>(default `fp8` when every GPU is a gfx1201; `0` = off);<br>`GGML_LF_DRAFT_UB`<br>(default `512`) shrinks the draft model's ubatch | speed/lossy | hipBLASLt |
+| `0001-605-k1-v7` | prefill matmuls of K-quant weights through hipBLASLt in fp8 (or f16); fp8 corrects the largest activation channels.  v7 = v6 with the residual ADD in the GEMM, the channel amax in the RMS norm and a faster weight conversion, the same output (+7.8 % at depth 0, +4.7 % at 32K on 2048-token batches).  v6 = v4 also taking batches of 384..1023 tokens on weights of 20M elements or more (a prompt's last batch, short prompts, the draft's batches), and converting Q4_K / Q5_K / IQ4_XS weights without the LDS round trip (same bytes, faster) | `GGML_LF_KQ_BLAS`<br>(default `fp8` when every GPU is a gfx1201; `0` = off);<br>`GGML_LF_DRAFT_UB`<br>(default `512`) shrinks the draft model's ubatch | speed/lossy | hipBLASLt |
 | `0002-605-f8-v5` | prefill flash attention in fp8 (and no growing F16 staging copy).  v5 = v4 with the row sum counted from the fp8 probabilities (numerator and denominator from the same numbers); v4 = v3.3, on by default | `GGML_LF_FA_FP8`<br>(default on; `0` = off) | speed/lossy | — |
-| `0003-605-m4-v3` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM.  v3 = v2, on by default | `GGML_LF_MXFP4_DIRECT`<br>(default `blaslt`; `0` = off) | speed/lossy | 0001 |
+| `0003-605-m4-v4` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM.  v4 = v3 with the residual ADD in the GEMM, as K1, the same logits (+2.0..+2.5 %).  v3 = v2, on by default | `GGML_LF_MXFP4_DIRECT`<br>(default `blaslt`; `0` = off) | speed/lossy | 0001 |
 | `0004-605-reasoning-guard-v2` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts).  v2 = v1, on by default | `LLAMA_REASONING_GUARD`<br>(default on; `0` = off) | guard | — |
-| `0005-605-backend-sampling-reserve-v1` | with `--backend-sampling`, the compute buffers are reserved once per sequence instead of being freed and allocated again for every request (upstream llama.cpp behavior; about 0.25 s per request on a 27B model at `-ub 2048`) | —<br>(always on) | fix | — |
-| `0006-605-mmvk-v3` | Q4_K / Q5_K / Q6_K matmuls of 1 to 8 tokens (decode and speculative verification) keep the activations in registers across several weight rows, and the matmuls that read the same input go out as one launch; not bit-identical to the stock kernel (float summation order), KLD below the run-to-run floor.  Only when llama-server verifies drafts (draft model, MTP or n-gram): one-token decode alone is faster on the stock kernel.  v3 = v2, on by default | `GGML_CUDA_MMVK`<br>(default `2`; `0` = off, `4` = also without drafts) | speed/diff | 0001, 0003 (context) |
+| `0005-605-state-bands-v1` | a state above `LLAMA_STATE_ASYNC_MAX_MIB` (256 MiB; the server's prompt cache saving or restoring a slot of a long context) takes the batched path the checkpoints take, one band at a time through the same pinned stage, instead of per-tensor copies into pageable memory.  The same bytes.  Only on a single device: a band may cut a piece at any byte, which a `-sm tensor` split does not serve | `LLAMA_STATE_ASYNC_BANDS`<br>(default on with one device; `0` = off, `1` = forced on) | speed | — |
+| `0006-605-mmvk-v4` | Q4_K / Q5_K / Q6_K matmuls of 1 to 8 tokens (decode and speculative verification) keep the activations in registers across several weight rows, and the matmuls that read the same input go out as one launch; not bit-identical to the stock kernel (float summation order), KLD below the run-to-run floor.  Only when llama-server verifies drafts (draft model, MTP or n-gram): one-token decode alone is faster on the stock kernel.  v3 = v2, on by default | `GGML_CUDA_MMVK`<br>(default `2`; `0` = off, `4` = also without drafts) | speed/diff | 0001, 0003 (context) |
 | `0007-605-spec-lenience-v1` | with sampled drafts (llama.cpp's own `--spec-draft-sampling probabilistic`, which covers DFlash2 drafts from this base on) a drafted token is accepted with probability min(1, p / (l·q)) instead of min(1, p / q): more drafted tokens kept, and no token more than 1/l times as likely as under the model.  Only at a request temperature above 0 | `LLAMA_SPEC_LENIENCE` or the request field `spec_lenience`<br>(default off; e.g. `0.8663`) | speed/lossy | 0004 (context) |
 | `0008-605-glu-inplace-v1` | the graph allocator may give a GLU (SwiGLU, GEGLU, ...) the memory of its gate when nothing else reads the gate, so an FFN's gate, up and GLU output are no longer all live at once; the K1 GLU kernel of `0001` drops its `restrict` qualifiers for that.  At `-ub 2048` the compute buffer is 150 MiB smaller on Qwen3.8-27B (one 136 MiB tensor plus the HIP margin) and 70 MiB on Qwen3.6-35B-A3B.  Same output: greedy text identical with it on and off on Linux and Windows (Qwen3.8-27B Q5_K and UD-Q4_K_XL, Qwen3.6-35B-A3B; K1 on and off; DFlash2, MTP and no draft; 1, 2 and 4 slots; `-ub 512` and `2048`; the CPU backend); prefill speed within ±0.4 % of the build without it | `GGML_GLU_INPLACE`<br>(default on; `0` = off) | memory | 0001 |
 | `0009-605-fa-band-split-v1` | on RDNA4, a draft-verification batch of 9 to 16 query rows (two slots of a unified KV cache verifying at once, or an n-gram draft longer than 7) runs its attention as two halves of at most 8 rows through the decode / verify kernel instead of the generic one, which re-reads the KV cache several times: at 110K cells such a step takes 30-34% less time, and two slots decoding at once at 50K each went from 13-19% below one slot alone to 33-38% above it.  Only from 8192 KV cells (below, two launches cost more than they save).  Each row gets the same result as in a batch of 8 rows or fewer; not bit-identical to the stock generic kernel | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on; `0` = off);<br>`GGML_CUDA_FA_BAND_SPLIT_MIN_KV`<br>(default `8192`) | speed/diff | 0002 (context) |
@@ -25,6 +24,8 @@ Type: `memory` = less VRAM, same output; `speed/lossy` = faster, with error abov
 
 ## Change log
 
+**2026-10-31 (r184):** the patches move to rdna-boosts `v16-6050b467c-r184`; older sets are removed.  `0001` v7 and `0003` v4 add the faster fp8 path, the same output.  New `0005`: large state copies in bands.  The former `0005` (backend sampling) is in rdna-boosts since r169.  `0006` v4 changes only an include line.
+
 **2026-10-31 (later):** `optional/0014` v2 replaces v1b: n-gram drafts from the current prompt only, with a key check on the table, and no tracking of what the model writes; use it with `--spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30`.  The default command no longer has n-gram drafts.
 
 **2026-10-31:** `0015` v3 no longer needs `0014` in its context (same code).  `0014` moved to `patches/optional/` and applies on top of `0015`, with the same result as before.
@@ -35,8 +36,7 @@ memory, 150 MiB less compute buffer at `-ub 2048` on Qwen3.8-27B, same output.  
 **2026-10-28 (night):** `0008` withdrawn (the Windows build fix for r143 to r146): on Windows use r147 or later.
 
 **2026-10-28 (evening):** `0013` v3: the anchored rollback is on by default (`LLAMA_RS_ANCHOR=0` turns it off; left
-unset, `GGML_LF_ALL=0` turns it off too); otherwise the same as v2.  v2 users can apply
-[`patches/increments/0013-605-gdn-verify-anchor-v2-to-v3.patch`](patches/increments/0013-605-gdn-verify-anchor-v2-to-v3.patch).
+unset, `GGML_LF_ALL=0` turns it off too); otherwise the same as v2.
 
 **2026-10-28 (later):** new `0013` v2 (v1 was not published): non-temporal hints in the GDN verify kernel, the opt-in
 anchored rollback (`LLAMA_RS_ANCHOR=1`: same output, about 1 GiB less VRAM with 2 slots), and a fix for 3 or more slots (a
@@ -45,18 +45,14 @@ output can then differ from the plain release, where the release reads another s
 
 **2026-10-28:** for rdna-boosts r156: `0015` v2 shares r154's own `LLAMA_SPEC_ALIGN`, and the cut to the shortest draft
 gets its own switch, `LLAMA_SPEC_ALIGN_CUT` (a copying slot next to a Chinese-text slot, both at once: 109.4 t/s with the
-cut, 102.9 without); the other files are unchanged.  `0015` v1 and `0008` moved to [`patches/r144/`](patches/r144) for
-r144 to r153.  On r156 `GGML_LF_ALL=0` gives the same output as the plain release.
+cut, 102.9 without); the other files are unchanged.  On r156 `GGML_LF_ALL=0` gives the same output as the plain release.
 
-**2026-10-27:** a new set for rdna-boosts `v15-6050b467c-r144` (upstream base `6050b467c`); the r59 set moved to
-[`patches/r59/`](patches/r59).  **The patches are now on by default** (`0` turns one off, `GGML_LF_ALL=0` every switch left
+**2026-10-27:** a new set for rdna-boosts `v15-6050b467c-r144` (upstream base `6050b467c`); the r59 set was kept apart.  **The patches are now on by default** (`0` turns one off, `GGML_LF_ALL=0` every switch left
 unset; [SWITCHES.md](SWITCHES.md)).  New: `0007`, the lenience of sampled-draft verification (llama.cpp now samples DFlash2
 drafts itself, which the old 0007 added; lossy, off unless `LLAMA_SPEC_LENIENCE` is set), `0008` for the Windows build,
 `0009` (9-16 row verification through the decode / verify kernel), `0012` (DFlash2 adaptive verify width), `0014` (shadow
 n-gram) and `0015` (one draft length per verify batch).  `0002` v5 counts F8's row sum from the fp8 probabilities: F8's own
-KLD on a 170K-token conversation 0.000396 to 0.000307 (floor 0.00021), same speed; v4 users can apply
-[`patches/increments/0002-605-f8-v4-to-v5.patch`](patches/increments/0002-605-f8-v4-to-v5.patch).  In `patches/r59/`,
-`0007` v3 fixes `--spec-draft-p-min` above 0 (v2 skewed the output distribution).  See the [report](reports/2026-10-27.md).
+KLD on a 170K-token conversation 0.000396 to 0.000307 (floor 0.00021), same speed.  See the [report](reports/2026-10-27.md).
 
 **2026-10-24:** new `0007`: DFlash2 probabilistic drafting, **a trade-off, off by default** (`--spec-draft-sampling probabilistic`).  A sampled request's draft is sampled too and verified by rejection sampling: same output distribution, different tokens.  Code / math at temperature 0.7-1.0 got faster (+11% to +31% on r59, +5% to +17% on r115); low-temperature agent turns got slower (−3.9% at 0.3).  Measure on your own workload.  See the [report](reports/2026-10-24.md).
 

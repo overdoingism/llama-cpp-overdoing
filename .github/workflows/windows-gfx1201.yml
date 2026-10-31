@@ -9,7 +9,7 @@ on:
     inputs:
       rdna_boosts:
         description: "llama-cpp-rdna-boosts release tag the patches are applied on"
-        default: "v15-6050b467c-r156"
+        default: "v16-6050b467c-r184"
   push:
     branches: [ci-windows]
 
@@ -19,7 +19,7 @@ permissions:
   attestations: write
 
 env:
-  RB_TAG: ${{ inputs.rdna_boosts || 'v15-6050b467c-r156' }}
+  RB_TAG: ${{ inputs.rdna_boosts || 'v16-6050b467c-r184' }}
   ROCM_URL: https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx120X-all-10.0.0.tar.gz
   ROCM_SHA256: 75da73c483cbc0456d9008f2079b333f4f9d3b7744705378ff8007e502ca38c5
 
