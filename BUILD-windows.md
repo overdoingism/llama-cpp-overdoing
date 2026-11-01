@@ -9,7 +9,7 @@ git config --global core.autocrlf false        # before cloning: patches need LF
 git clone https://github.com/ggml-org/llama.cpp; cd llama.cpp
 git checkout 6050b467c
 git clone https://github.com/stew675/llama-cpp-rdna-boosts ..\rdna-boosts
-git -C ..\rdna-boosts checkout v16-6050b467c-r184
+git -C ..\rdna-boosts checkout v16-6050b467c-r195
 bash ../rdna-boosts/scripts/apply-all.sh .            # Git for Windows bash; makes branch rdna-boosts
 Get-ChildItem C:\path\to\llama-cpp-overdoing\patches\0*-605-*.patch | Sort-Object Name | ForEach-Object { git apply --check $_.FullName; if ($?) { git apply $_.FullName } }
 $root = "C:\path\to\_rocm_sdk_devel"
@@ -47,7 +47,7 @@ Copy-Item -Recurse $k.FullName build\bin\       # hipBLASLt kernels for gfx1201,
 給 AI 助理看。需要 Windows 版 ROCm SDK（TheRock 的 `_rocm_sdk_devel`，含 hipBLASLt）、Ninja、Git for Windows（提供 `bash`）；GPU 為 gfx1201。在 PowerShell 操作。
 
 1. **clone 之前**先設 `git config --global core.autocrlf false`，patch 需要 LF 換行。
-2. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `6050b467c`；clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v16-6050b467c-r184`，用 Git for Windows 的 `bash` 在 llama.cpp 目錄執行 `apply-all.sh .`。
+2. clone [llama.cpp](https://github.com/ggml-org/llama.cpp)，checkout `6050b467c`；clone [rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)，checkout release tag `v16-6050b467c-r195`，用 Git for Windows 的 `bash` 在 llama.cpp 目錄執行 `apply-all.sh .`。
 3. 依編號順序 `git apply` 本 repo 的 patch（0003 需要 0001；0006 需要 0001 與 0003；0007 需要 0004；0008 需要 0001；0009 需要 0002；0015 需要 0012；其餘可單獨套）。patch 會新增 `.cu` 檔，套完一定要重跑 cmake 設定步驟。設定時若出現 `UI: download dist.tar.gz... failed`（嘗試下載網頁介面），可以忽略。
 4. cmake 用 Ninja，`-DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DGGML_HIP_NO_VMM=ON`，編譯器與 `CMAKE_PREFIX_PATH` 指向 ROCm SDK（見上方指令）。不要加 `-DGGML_HIP_RCCL=1`：它只在多卡時有作用，而 Windows SDK 可能沒有 RCCL（設定步驟會失敗）。
 5. **`GGML_HIP_NO_VMM` 一定要保持 ON**：設成 OFF 時，長上下文會溢出到共用 GPU 記憶體，prefill 掉到約四分之一。`GGML_HIP_LF_HIPBLASLT` 保持預設 ON。

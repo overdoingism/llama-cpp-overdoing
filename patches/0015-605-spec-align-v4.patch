@@ -26,16 +26,16 @@ behaviour for the chain.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- common/speculative.cpp | 135 +++++++++++++++++++++++++++++++++++++++--
+ common/speculative.cpp | 127 ++++++++++++++++++++++++++++++++++++++++-
  common/speculative.h   |   4 ++
- 2 files changed, 134 insertions(+), 5 deletions(-)
+ 2 files changed, 128 insertions(+), 3 deletions(-)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index af12a2287..54591b197 100644
+index f5f3c673f..473b81898 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -208,6 +208,41 @@ static bool spec_align_enabled() {
-     return enabled;
+@@ -228,6 +228,41 @@ static int spec_align_width_band() {
+     return band;
  }
  
 +// LLAMA_SPEC_ALIGN for the drafters outside draft-mtp-adaptive, only on a hybrid or recurrent target (other targets keep
@@ -76,7 +76,7 @@ index af12a2287..54591b197 100644
  // state of an implementation of speculative decoding
  //
  // each implementation has a unique type and a state that is implementation-specific
-@@ -255,6 +290,9 @@ struct common_speculative_impl {
+@@ -275,6 +310,9 @@ struct common_speculative_impl {
      // (checkpoint-restore path); accept() will not be called for that round
      virtual void accept_partial(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) {}
  
@@ -86,22 +86,15 @@ index af12a2287..54591b197 100644
      // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
      virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
      virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
-@@ -1094,12 +1132,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-         int32_t              n_last = 0;     // length of the last draft, 0 once its acceptance was fed back
-         int32_t              step   = 0;     // drafts so far (every 4th drafts one token past w)
-         llama_token          extra  = -1;    // draft token w+1 of the last draft
-+        int32_t              extra_k = 0;    // its position (w, or the aligned width)
-         bool                 full   = false; // the last draft was accepted in full: the next id_last decides extra
-         int32_t              pos    = 0;     // position of the sequence's last draft (the context length the cost sees)
-         std::vector<float>   h;              // running P(accepted | previous position accepted), per position
-         std::vector<int32_t> hist;           // verifications per width over the request
-     };
+@@ -1123,6 +1161,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     static constexpr int32_t  ADAPT_W_MIN = 3;
+     static constexpr int32_t  ADAPT_N_FAST = 16;
      bool                      adapt      = false;
 +    bool                      align      = false; // common_speculative_align_wanted
      int                       adapt_log  = 0;
      // one more verified position, as a fraction of a verification step (LLAMA_DFLASH_ADAPTIVE_COST; measured on gfx1201:
      // about 0.035 below 5 rows)
-@@ -1179,6 +1219,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1202,6 +1241,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              const char * la = getenv("GGML_LF_ALL");          // GGML_LF_ALL=0: off unless set
              adapt_log = ad != nullptr ? atoi(ad) : (la != nullptr && la[0] == '0' && la[1] == '\0' ? 0 : 1);
              adapt     = is_dflash2 && adapt_log > 0;
@@ -109,9 +102,9 @@ index af12a2287..54591b197 100644
              const char * ac = getenv("LLAMA_DFLASH_ADAPTIVE_COST");
              if (ac != nullptr && atof(ac) > 0.0) {
                  adapt_cost = (float) atof(ac);
-@@ -1537,6 +1578,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-         // can be checked against the target; the blocks of one batch have one length (the selector reads equal blocks),
-         // the longest asked for
+@@ -1559,6 +1599,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         // with the adaptive width a sequence drafts its w tokens; the blocks of one batch have one length (the selector reads
+         // equal blocks), the longest asked for
          int32_t n_draft = params.n_max;
 +        // several sequences drafted together verify in one batch: they all send the widest width among them, and at
 +        // least the length of a draft another drafter already made for the batch (an n-gram draft of a copying
@@ -134,34 +127,22 @@ index af12a2287..54591b197 100644
          if (adapt) {
              n_draft = 1;
              for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-@@ -1547,6 +1606,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-                 const bool probe = st.step++ % 4 == 0;
-                 n_draft = std::max(n_draft, std::min(params.n_max, st.w + (probe ? 1 : 0)));
+@@ -1567,6 +1625,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 }
+                 n_draft = std::max(n_draft, std::min(params.n_max, adapt_st[seq_id].w));
              }
 +            n_draft = std::max(n_draft, w_align);
          }
  
          for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-@@ -1561,7 +1621,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-                 auto & st = adapt_st[seq_id];
-                 if (st.full && st.extra >= 0) {
-                     // the target's token after a draft accepted in full decides draft token w+1
--                    adapt_observe(st, st.w, dp.id_last == st.extra);
-+                    adapt_observe(st, st.extra_k, dp.id_last == st.extra);
-                 }
-                 st.full  = false;
-                 st.extra = -1;
-@@ -1682,11 +1742,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1692,10 +1751,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
  
                  if (adapt) {
                      auto & st = adapt_st[seq_id];
 -                    if ((int32_t) result.size() > st.w) {
--                        st.extra = result[st.w];
 -                        result.resize(st.w);
 +                    const int32_t w = std::max(st.w, w_align);
 +                    if ((int32_t) result.size() > w) {
-+                        st.extra   = result[w];
-+                        st.extra_k = w;
 +                        result.resize(w);
                          if (sample) {
 -                            dp.result_q->resize(st.w);
@@ -169,24 +150,22 @@ index af12a2287..54591b197 100644
                          }
                      }
                      st.n_last = (int32_t) result.size();
-@@ -1846,6 +1908,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1851,6 +1911,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              adapt_feedback(seq_id, n_accepted);
          }
      }
 +
-+    // the verified draft is shorter than the one recorded: the positions past n were not verified, and the probe token
-+    // no longer follows the last verified one
++    // the verified draft is shorter than the one recorded: the positions past n were not verified
 +    void truncated(llama_seq_id seq_id, int32_t n) override {
 +        if (adapt && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
 +            auto & st = adapt_st[seq_id];
 +            st.n_last = std::min(st.n_last, n);
-+            st.extra  = -1;
 +        }
 +    }
  };
  
  struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-@@ -2989,6 +3061,9 @@ struct common_speculative {
+@@ -2999,6 +3067,9 @@ struct common_speculative {
      std::vector<common_speculative_impl *> impl_last;
  
      std::vector<double> synth_probs;
@@ -196,7 +175,7 @@ index af12a2287..54591b197 100644
  };
  
  static common_ngram_map get_common_ngram_map(
-@@ -3635,6 +3710,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3645,6 +3716,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          /* .impls       = */ std::move(impls),
          /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
          /* .synth_probs = */ {},
@@ -204,7 +183,7 @@ index af12a2287..54591b197 100644
      });
  
      const int32_t n_max_configured = common_speculative_n_max(&params);
-@@ -3724,6 +3800,13 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3734,6 +3806,13 @@ void common_speculative_draft(common_speculative * spec) {
  
      auto & dparams = spec->dparams;
  
@@ -218,7 +197,7 @@ index af12a2287..54591b197 100644
      {
          int n_drafting = 0;
  
-@@ -3741,6 +3824,17 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3751,6 +3830,17 @@ void common_speculative_draft(common_speculative * spec) {
      }
  
      for (auto & impl : spec->impls) {
@@ -236,7 +215,7 @@ index af12a2287..54591b197 100644
          {
              common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
              impl->draft(dparams);
-@@ -3805,6 +3899,37 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3815,6 +3905,37 @@ void common_speculative_draft(common_speculative * spec) {
              dp.drafting = false;
          }
      }

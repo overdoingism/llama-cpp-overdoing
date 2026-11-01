@@ -58,10 +58,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 ggml/src/ggml-cuda/lf-kq-blas.cuh
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 5a137512e..038174251 100644
+index a60b0279f..b02e5879f 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1838,6 +1838,44 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+@@ -1854,6 +1854,44 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
          }
          llama_memory_clear(llama_get_memory(lctx), true);
          llama_synchronize(lctx);
@@ -107,10 +107,10 @@ index 5a137512e..038174251 100644
  
          // reset samplers to reset RNG state after warmup to the seeded state
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 9355f2680..f4fa4106c 100644
+index f63dca95a..9a34420b1 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -3105,6 +3105,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -3130,6 +3130,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
          }
      }
  
@@ -131,7 +131,7 @@ index 9355f2680..f4fa4106c 100644
      // was set explicitly (-ctkd / -ctvd / their env vars).  Upstream defaults the draft to f16 whatever
      // -ctk / -ctv says, which is invisible and costs VRAM: on a dense 27B MTP run (-c 131072) the draft
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index b7b4b243d..82c30c2be 100644
+index 01a83eabb..dc3b9dcf7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -8,6 +8,7 @@
@@ -142,7 +142,7 @@ index b7b4b243d..82c30c2be 100644
  #include "ggml-cuda/acc.cuh"
  #include "ggml-cuda/add-id.cuh"
  #include "ggml-cuda/arange.cuh"
-@@ -1919,6 +1920,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2096,6 +2097,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      }
      // MoE down + weighted reduction fold (owned by moe-weighted-reduction.cu): arms the down MUL_MAT_ID, fuses no node
      ggml_cuda_mwr_fold_mark(*cuda_ctx, cgraph, i);
@@ -152,7 +152,7 @@ index b7b4b243d..82c30c2be 100644
      // a skipped GDN norm whose gate node was passed (taken by another fusion) or left in an earlier graph
      if (cuda_ctx->gdn_norm_pending != nullptr && (i == 0 || i > cuda_ctx->gdn_norm_gate_at)) {
          GGML_ABORT("GDN norm %s was skipped but its gate node was never reached", cuda_ctx->gdn_norm_pending->name);
-@@ -1943,6 +1947,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2120,6 +2124,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      if (cuda_ctx->gdn_norm_pending != nullptr && i < cuda_ctx->gdn_norm_gate_at) {
          return 0;
      }
@@ -165,7 +165,7 @@ index b7b4b243d..82c30c2be 100644
          return n_cont_gate;
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a098a5523..81dbf46b6 100644
+index 873beff41..a8184a441 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -20,6 +20,7 @@
@@ -176,7 +176,7 @@ index a098a5523..81dbf46b6 100644
  #include "ggml-cuda/count-equal.cuh"
  #include "ggml-cuda/cpy.cuh"
  #include "ggml-cuda/cross-entropy-loss.cuh"
-@@ -4945,6 +4946,11 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -5022,6 +5023,11 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
          return false;
      }
  
@@ -188,7 +188,7 @@ index a098a5523..81dbf46b6 100644
      return true;
  }
  
-@@ -5061,6 +5067,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -5138,6 +5144,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      const int cc        = ggml_cuda_info().devices[ctx.device].cc;
      const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
  
@@ -201,7 +201,7 @@ index a098a5523..81dbf46b6 100644
      // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
      // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
      // (n_tokens <= 8) stays on the existing kernels and W = 1..8 is bit-identical either way.
-@@ -6952,6 +6964,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7071,6 +7083,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      cuda_ctx->q8_1_cache_clear();
      cuda_ctx->mwr_done_graph = nullptr;
      cuda_ctx->bf16_src1_cache_clear();
@@ -209,7 +209,7 @@ index a098a5523..81dbf46b6 100644
      ggml_cuda_mmb_set_active_ctx(cuda_ctx);
      ggml_cuda_mmb_begin_graph();
  
-@@ -9253,6 +9266,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9463,6 +9476,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }

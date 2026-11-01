@@ -33,7 +33,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cuh
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 9359bcf78..9e1455187 100644
+index f3f096aff..b895e4a7e 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1728,9 +1728,32 @@ void   ggml_cuda_h2d_ring_cap_set(size_t bytes);
@@ -70,7 +70,7 @@ index 9359bcf78..9e1455187 100644
      }();
      return stage_max_bytes;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index e3a9707f3..855dd929b 100644
+index 38134c491..8778b27c7 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -4,6 +4,7 @@
@@ -81,7 +81,7 @@ index e3a9707f3..855dd929b 100644
  
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
  // one list per group of ncols1 queries: a column is selected if any query of the group can see it
-@@ -902,6 +903,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -904,6 +905,11 @@ thread_local ggml_cuda_fa_had_req ggml_cuda_fa_had;
  
  void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      ggml_cuda_set_device(ctx.device);

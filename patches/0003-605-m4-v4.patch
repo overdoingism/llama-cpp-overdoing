@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 ggml/src/ggml-cuda/lf-mxfp4.cuh
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 81dbf46b6..ac508998f 100644
+index a8184a441..f5274ea8a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -21,6 +21,7 @@
@@ -37,7 +37,7 @@ index 81dbf46b6..ac508998f 100644
  #include "ggml-cuda/count-equal.cuh"
  #include "ggml-cuda/cpy.cuh"
  #include "ggml-cuda/cross-entropy-loss.cuh"
-@@ -4947,7 +4948,7 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -5024,7 +5025,7 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
      }
  
      // Llama-Frankenstein K1: the hipBLASLt f16 prefill GEMM (GGML_LF_KQ_BLAS) takes these matmuls unfused
@@ -46,7 +46,7 @@ index 81dbf46b6..ac508998f 100644
          return false;
      }
  
-@@ -5072,6 +5073,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -5149,6 +5150,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          ggml_cuda_lf_kq_blas_mul_mat(ctx, src0, src1, dst);
          return;
      }
@@ -58,7 +58,7 @@ index 81dbf46b6..ac508998f 100644
  
      // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
      // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
-@@ -6965,6 +6971,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7084,6 +7090,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      cuda_ctx->mwr_done_graph = nullptr;
      cuda_ctx->bf16_src1_cache_clear();
      ggml_cuda_lf_kq_blas_graph_begin();

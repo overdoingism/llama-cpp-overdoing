@@ -23,18 +23,18 @@ rows: two band launches 376 us against one generic launch 595 us.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- ggml/src/ggml-cuda/fattn.cu | 99 +++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn.cu | 98 +++++++++++++++++++++++++++++++++++++
  tests/test-backend-ops.cpp  | 15 ++++++
- 2 files changed, 114 insertions(+)
+ 2 files changed, 113 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 855dd929b..995d11b7e 100644
+index 8778b27c7..cdbb0fb84 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -901,8 +901,107 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
-     return f16_extra.end - (uintptr_t) dst->data;
+@@ -902,9 +902,107 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
  }
  
+ thread_local ggml_cuda_fa_had_req ggml_cuda_fa_had;
 +// RDNA4 verify batches of 9..16 query rows (an n-gram draft longer than 7, or two slots of a unified KV cache verifying
 +// the same width in one ubatch) fall off the decode/verify band onto the generic WMMA config, which for GQA 6 re-reads
 +// every K/V element three times: at 110K cells such a batch spends about five times the band's attention time.  The
@@ -130,7 +130,7 @@ index 855dd929b..995d11b7e 100644
 +    }
 +    return true;
 +}
-+
+ 
  void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      ggml_cuda_set_device(ctx.device);
 +    if (ggml_cuda_flash_attn_ext_band_split(ctx, dst)) {

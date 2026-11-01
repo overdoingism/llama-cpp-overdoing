@@ -117,10 +117,10 @@ index 7af92e9dd..3d2958613 100644
 +    uint64_t hash(const entry_t * tokens) const;
  };
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 54591b197..b0a46d8c4 100644
+index 473b81898..18469ae5b 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2728,12 +2728,32 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
+@@ -2734,12 +2734,32 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
      }
  };
  
@@ -153,7 +153,7 @@ index 54591b197..b0a46d8c4 100644
      // enable trace logging if LLAMA_TRACE is set
      const bool verbose;
  
-@@ -2755,7 +2775,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+@@ -2761,7 +2781,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
              uint32_t n_seq)
          : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
          , params(params.ngram_mod)
@@ -162,7 +162,7 @@ index 54591b197..b0a46d8c4 100644
          , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
          static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
  
-@@ -2771,14 +2791,27 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+@@ -2777,14 +2797,27 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
          }
  
          sinfos.resize(n_seq);
@@ -190,7 +190,7 @@ index 54591b197..b0a46d8c4 100644
          const size_t n = mod.get_n();
          if (prompt.size() < n) {
              return;
-@@ -2806,6 +2839,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+@@ -2812,6 +2845,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
              common_speculative_draft_params & dparams) {
          auto & sinfo = sinfos[seq_id];
          auto & result = *dparams.result;
@@ -198,7 +198,7 @@ index 54591b197..b0a46d8c4 100644
  
          const auto & prompt = *dparams.prompt;
  
-@@ -2819,7 +2853,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+@@ -2825,7 +2859,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
          const size_t n = mod.get_n();
  
          // add new ngrams in chunks
@@ -207,7 +207,7 @@ index 54591b197..b0a46d8c4 100644
              for (size_t i = sinfo.i_last; i < cur_len - n; ++i) {
                  mod.add(prompt.data() + i);
              }
-@@ -2892,9 +2926,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+@@ -2898,9 +2932,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                          SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
                      }
  

@@ -20,10 +20,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 138 insertions(+), 34 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ffe6a0557..e9c68f15a 100644
+index 56f2a3366..fe33d531d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -4370,20 +4370,73 @@ private:
+@@ -4371,20 +4371,73 @@ private:
  // synchronous read costs a device sync plus a bounce through the shared pinned chunk.  Instead, queue them all
  // as async copies into one reused pinned staging area, synchronize each backend once, and copy to the caller's
  // buffer on the host.  Restores are batched the same way through the same stage (llama_io_read_host, below;
@@ -102,7 +102,7 @@ index ffe6a0557..e9c68f15a 100644
  }
  
  // Pipelined batched state copies (fold r151, PR #233).  The batched copy ran the host memcpy into/out of the
-@@ -4648,22 +4701,47 @@ static bool llama_state_copy_bounces(ggml_backend_buffer_t buf) {
+@@ -4649,22 +4702,47 @@ static bool llama_state_copy_bounces(ggml_backend_buffer_t buf) {
  }
  
  class llama_io_write_host : public llama_io_write_i {
@@ -155,7 +155,7 @@ index ffe6a0557..e9c68f15a 100644
                  return false;
              }
          }
-@@ -4671,9 +4749,9 @@ public:
+@@ -4672,9 +4750,9 @@ public:
          if (stage == nullptr) {
              return false;
          }
@@ -168,7 +168,7 @@ index ffe6a0557..e9c68f15a 100644
          }
          const std::vector<size_t> grp = llama_state_pipe_groups(sizes, total);
          const size_t n_grp = grp.size() - 1;
-@@ -4699,8 +4777,8 @@ public:
+@@ -4700,8 +4778,8 @@ public:
          size_t off = 0;
          for (size_t g = 0; g < n_grp; ++g) {
              for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
@@ -179,7 +179,7 @@ index ffe6a0557..e9c68f15a 100644
              }
              if (piped) {
                  for (const auto & be : grp_ev[g]) {
-@@ -4712,10 +4790,10 @@ public:
+@@ -4713,10 +4791,10 @@ public:
              llama_state_sync_all(bks);
          }
          size_t stage_off = 0;
@@ -194,7 +194,7 @@ index ffe6a0557..e9c68f15a 100644
          }
          const int n_copy_threads = llama_state_copy_threads(total);
          const int64_t t_copy = ggml_time_us();
-@@ -4730,7 +4808,7 @@ public:
+@@ -4731,7 +4809,7 @@ public:
          if (st_timing) {
              const int64_t t_end = ggml_time_us();
              LLAMA_LOG_INFO("state get: %zu pieces, %.1f MiB in %zu group(s): enqueue %.2f ms, copy+wait %.2f ms "
@@ -203,7 +203,7 @@ index ffe6a0557..e9c68f15a 100644
                             (t_copy - t_enq) / 1e3, (t_end - t_copy) / 1e3,
                             total / 1073741824.0 / std::max(1e-6, (t_end - t_copy) / 1e6), (t_end - t_enq) / 1e3);
          }
-@@ -4839,6 +4917,8 @@ private:
+@@ -4840,6 +4918,8 @@ private:
  };
  
  class llama_io_read_host : public llama_io_read_i {
@@ -212,7 +212,7 @@ index ffe6a0557..e9c68f15a 100644
  public:
      llama_io_read_host(const uint8_t * p, size_t len, llama_context * lctx = nullptr) : ptr(p), lctx(lctx), buf_size(len) {}
  
-@@ -4855,12 +4935,36 @@ public:
+@@ -4856,12 +4936,36 @@ public:
          for (const auto & r : rinfos) {
              total += r.size;
          }
@@ -253,7 +253,7 @@ index ffe6a0557..e9c68f15a 100644
                  return false;
              }
          }
-@@ -4870,17 +4974,17 @@ public:
+@@ -4871,17 +4975,17 @@ public:
          }
          // the pieces sit between small metadata fields in the caller's buffer, so pack them one by one; a group's device
          // copies are queued before the next group is packed, so they overlap its memcpy (see llama_state_pipe_groups)
@@ -278,7 +278,7 @@ index ffe6a0557..e9c68f15a 100644
          }
          static const bool st_timing = getenv("LLAMA_STATE_TIMING") != nullptr;
          const int n_copy_threads = llama_state_copy_threads(total);
-@@ -4888,11 +4992,11 @@ public:
+@@ -4889,11 +4993,11 @@ public:
          for (size_t g = 0; g + 1 < grp.size(); ++g) {
              llama_state_copy_pieces(pcs, grp[g], grp[g + 1], n_copy_threads);
              for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
@@ -292,7 +292,7 @@ index ffe6a0557..e9c68f15a 100644
                             total / 1048576.0, grp.size() - 1, (ggml_time_us() - t_pack) / 1e3);
          }
          llama_state_sync_all(bks);   // the stage is reused by the next state copy on this context
-@@ -5345,7 +5449,7 @@ uint8_t * llama_context::state_stage(size_t size) {
+@@ -5346,7 +5450,7 @@ uint8_t * llama_context::state_stage(size_t size) {
      if (buf_state_stage == nullptr || ggml_backend_buffer_get_size(buf_state_stage.get()) < size) {
          buf_state_stage.reset();
          // the pinned type of the output device (the first simple device of a meta device), as for the outputs

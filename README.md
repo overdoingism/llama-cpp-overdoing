@@ -3,15 +3,14 @@
 Extra patches for [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) on AMD RDNA4 (gfx1201, Radeon AI PRO R9700),
 for the changes that are **not** part of rdna-boosts: mostly lossy prefill speed-ups, a faster decode / draft-verification
 matmul, a guard against replies that end inside the reasoning, an opt-in lenience for sampled drafts, faster wide draft
-verification, a smaller recurrent-state cache for draft verification, a smaller FFN compute buffer, and fixes of
-upstream llama.cpp code that we keep here.
+verification, a smaller recurrent-state cache for draft verification, and a smaller FFN compute buffer.
 Most other bit-identical work goes to rdna-boosts itself.
 Patches only; MIT.  Written with Claude (AI).
 
 ## Patches
 
 File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `patches/` are for rdna-boosts
-`v16-6050b467c-r184` (upstream base `6050b467c`).
+`v16-6050b467c-r195` (upstream base `6050b467c`).
 
 | patch | what | switch | type |
 |---|---|---|---|
@@ -24,10 +23,10 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | `0007-605-spec-lenience-v1` | keep more sampled-draft tokens | `LLAMA_SPEC_LENIENCE`<br>(default off) | speed/<br>lossy |
 | `0008-605-glu-inplace-v1` | an FFN's gate, up and GLU output not all live at once (150 MiB less compute buffer at `-ub 2048`) | `GGML_GLU_INPLACE`<br>(default on) | memory |
 | `0009-605-fa-band-split-v1` | faster 9-16 row draft verification | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | speed/<br>diff |
-| `0012-605-dflash-adaptive-width-v1` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
-| `0013-605-gdn-verify-anchor-v3` | Qwen3.x draft verification keeps two recurrent-state planes, not one per draft token (about 1 GiB less VRAM); a moved cell keeps its rollback snapshots | `LLAMA_RS_ANCHOR`<br>(default on);<br>`GGML_CUDA_GDN_NT`<br>(default on) | speed,<br>fix |
-| `optional/0014-605-ngram-prompt-only-v2` | n-gram drafts from the current prompt only, with a key check: for rewriting whole files | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>(default on, with `ngram-mod`) | speed/<br>trade-off |
-| `0015-605-spec-align-v3` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
+| `0012-605-dflash-adaptive-width-v2` | DFlash2 verify width from the acceptance | `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | speed |
+| `0013-605-gdn-verify-anchor-v4` | Qwen3.x draft verification keeps two recurrent-state planes, not one per draft token (about 1 GiB less VRAM) | `LLAMA_RS_ANCHOR`<br>(default on);<br>`GGML_CUDA_GDN_NT`<br>(default on) | speed |
+| `0014-605-ngram-prompt-only-v2` | n-gram drafts from the current prompt only, with a key check: for rewriting whole files | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>(default on, with `ngram-mod`) | speed/<br>trade-off |
+| `0015-605-spec-align-v4` | slots verifying together send drafts of one length | `LLAMA_SPEC_ALIGN`,<br>`LLAMA_SPEC_ALIGN_CUT`<br>(default on) | speed |
 
 <sub>0010, 0011 (Temporarily)</sub>
 
@@ -66,13 +65,11 @@ Two slots decoding at once at 50K each: 13-19% slower than one after the other w
 live at once: at `-ub 2048` the compute buffer is 150 MiB smaller on Qwen3.8-27B and 70 MiB on Qwen3.6-35B-A3B.  The output
 is the same, and prefill speed did not change.
 
-`0013` v3 (`LLAMA_RS_ANCHOR=0` turns the anchor off): draft verification on qwen35 / qwen35moe models (Qwen3.5 to 3.8) keeps, per slot, the
+`0013` (`LLAMA_RS_ANCHOR=0` turns the anchor off): draft verification on qwen35 / qwen35moe models (Qwen3.5 to 3.8) keeps, per slot, the
 recurrent state before and after the last batch plus small per-token replay factors, instead of one full state per draft
 token, and replays the accepted part when a draft is partly rejected.  The output is the same.  Qwen3.8-27B with DFlash2:
 1.03 GiB less VRAM with 2 slots, 0.51 GiB with 1 (`-c 131072`); each decode step 0.3-0.4% faster, two slots decoding at
-once 2-4% faster.  Its fix, always on: with 3 or more slots, a slot that had just verified a draft could have its cell
-moved by another slot's batch in the same decode, lose its rollback snapshots, and continue from another slot's state
-(upstream llama.cpp has this too).  With 1 or 2 slots nothing changes.
+once 2-4% faster.
 
 ## Switches
 
@@ -89,8 +86,8 @@ without mmap) they count against the driver's limit.  Not needed on Windows.
 
 ## Applicable versions
 
-Tested on rdna-boosts `v16-6050b467c-r184`: the patches in `patches/` apply in number order on the plain release, build, and
-give the History numbers; `patches/optional/0014` applies on top of them.  On another release, check with `git apply --check`
+Tested on rdna-boosts `v16-6050b467c-r195`: the patches in `patches/` apply in number order on the plain release, build, and
+give the History numbers.  On another release, check with `git apply --check`
 first.  A release on a new upstream base (not `6050b467c`) needs a new patch set.
 
 ## History
@@ -114,6 +111,8 @@ Each dated row: this repo's patches of that date on it, all on; the date links t
 | [2026&#8209;10&#8209;28](PATCHES.md#change-log) | + K1&nbsp;v4, F8&nbsp;v5, M4&nbsp;v3, mmvk&nbsp;v3 (the defaults) | **2300** | **58.8** | **2467** | **61.0** |
 | original | `v16-6050b467c-r184` | 1163 | 53.4 | 1392 | 58.9 |
 | [2026&#8209;10&#8209;31](PATCHES.md#change-log) | + K1&nbsp;v7, F8&nbsp;v5, M4&nbsp;v4, mmvk&nbsp;v4 (the defaults) | **2508** | **59.4** | **2530** | **61.8** |
+| original | `v16-6050b467c-r195` | 1155 | 53.4 | 1388 | 58.7 |
+| [2026&#8209;11&#8209;01](PATCHES.md#change-log) | + K1&nbsp;v7, F8&nbsp;v5, M4&nbsp;v4, mmvk&nbsp;v4 (the defaults) | **2510** | **59.4** | **2531** | **61.2** |
 
 Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.  From r144 to r156 the time per decode step did not change (MXFP4:
 43.35 / 43.21 ms with the patches); the decode figures moved with the draft acceptance, as the generated text changed.
@@ -143,8 +142,8 @@ HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 9
 - `-md ... -ngld 99 --spec-draft-n-max 5`: the DFlash2 draft model, for Qwen3.8-27B only
   ([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), Q4_K_M).  With any other
   model leave out the last three lines.
-- `--spec-type draft-dflash`: DFlash2 alone.  To rewrite whole files faster, apply `optional/0014` and use
-  `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` instead: whole-file edits +33..+66 %, other requests
+- `--spec-type draft-dflash`: DFlash2 alone.  To rewrite whole files faster, use
+  `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` instead (`0014`; our own server runs this): whole-file edits +33..+66 %, other requests
   about the same, one long English continuation -4 % (Qwen3.8-27B, one request at a time).  The parameters are upstream's;
   rdna-boosts clamps the length to 15.
 - `--spec-draft-sampling probabilistic`: llama.cpp's own; sampled drafts, verified exactly by rejection sampling (it
