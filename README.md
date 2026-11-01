@@ -125,7 +125,7 @@ without `HSA_USERPTR_FOR_PAGED_MEM` and with `--poll 0`):
 HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 131072 --kv-unified \
   -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 \
   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf -ngld 99 --spec-draft-n-max 5 \
-  --spec-type draft-dflash \
+  --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30 \
   --spec-draft-sampling probabilistic
 ```
 
@@ -134,10 +134,10 @@ HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 9
 - `-md ... -ngld 99 --spec-draft-n-max 5`: the DFlash2 draft model, for Qwen3.8-27B only
   ([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), Q4_K_M).  With any other
   model leave out the last three lines.
-- `--spec-type draft-dflash`: DFlash2 alone.  To rewrite whole files faster, use
-  `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` instead (`0014`; our own server runs this): whole-file edits +33..+66 %, other requests
-  about the same, one long English continuation -4 % (Qwen3.8-27B, one request at a time).  The parameters are upstream's;
-  rdna-boosts clamps the length to 15.
+- `--spec-type ngram-mod,draft-dflash ...`: n-gram drafts from the current prompt (`0014`), and DFlash2 when there is no
+  hit.  Against DFlash2 alone (`--spec-type draft-dflash`, which also saves the 32 MiB per sequence of `0014`'s table):
+  whole-file edits +33..+66 %, other requests about the same, one long English continuation -4 % (Qwen3.8-27B, one request
+  at a time).  The parameters are upstream's; rdna-boosts clamps the length to 15.
 - `--spec-draft-sampling probabilistic`: llama.cpp's own; sampled drafts, verified exactly by rejection sampling (it
   matters at temperature > 0).  `0007` (`LLAMA_SPEC_LENIENCE`, lossy, off by default) builds on it.
 - `HSA_USERPTR_FOR_PAGED_MEM=0`: Linux only ([Switches](#switches)).

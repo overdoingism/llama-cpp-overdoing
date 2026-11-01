@@ -39,7 +39,12 @@ if ($draftPath) {
         "--model-draft", $draftPath
         "--n-gpu-layers-draft", "99"
         "--spec-draft-n-max", "5"
-        "--spec-type", "draft-dflash"
+        # n-gram drafts from the current prompt first (patch 0014: whole-file rewrites go much faster), DFlash2 when there is no hit;
+        # for DFlash2 alone: "--spec-type", "draft-dflash" and no --spec-ngram-mod-* lines
+        "--spec-type", "ngram-mod,draft-dflash"
+        "--spec-ngram-mod-n-max", "15"
+        "--spec-ngram-mod-n-min", "1"
+        "--spec-ngram-mod-n-match", "30"
         # sampled drafts, verified exactly by rejection sampling (llama.cpp's own; matters at temperature > 0)
         "--spec-draft-sampling", "probabilistic"
     )
