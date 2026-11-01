@@ -93,29 +93,21 @@ first.  A release on a new upstream base (not `6050b467c`) needs a new patch set
 ## History
 
 Speed on the standard benchmark (Qwen3.8-27B, 32K-token prompt, R9700, Linux), tokens/s.  `original`: plain rdna-boosts.
-Each dated row: this repo's patches of that date on it, all on; the date links to the report (setup and KLD).
+Each dated row: this repo's patches of that date, all on, on the release it names (or else the `original` above it); the date links to
+the report (setup and KLD).
 
 | date | build | Q5 prefill | Q5 decode | MXFP4 prefill | MXFP4 decode |
 |---|---|---|---|---|---|
 | original | `v16-a55e952b8-r8` | 983 | 47.4 | 1151 | 54.7 |
 | [2026&#8209;10&#8209;07](reports/2026-10-07.md) | + K1&nbsp;v2, F8&nbsp;v3.1, M4&nbsp;v2 | **1958** | 47.5 | **2393** | **63.0** |
 | [2026&#8209;10&#8209;12](reports/2026-10-12.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1954** | 49.0 | **2388** | **62.9** |
-| original | `v16-097cf33d9-r50` | 1124 | 50.8 | 1344 | 60.8 |
-| [2026&#8209;10&#8209;13](reports/2026-10-13.md) | + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1959** | 50.6 | **2397** | **66.2** |
-| original | `v12-097cf33d9-r59` | 1125 | 51.1 | 1335 | 60.0 |
-| [2026&#8209;10&#8209;15](reports/2026-10-15.md) | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2 | **2197** | 50.4 | **2365** | **66.2** |
-| [2026&#8209;10&#8209;18](reports/2026-10-18.md) | + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2, mmvk&nbsp;v2 | **2207** | **53.8** | **2389** | **67.2** |
-| original | `v15-6050b467c-r144` | 1154 | 50.7 | 1381 | 63.5 |
-| [2026&#8209;10&#8209;27](reports/2026-10-27.md) | + K1&nbsp;v4, F8&nbsp;v4, M4&nbsp;v3, mmvk&nbsp;v3 (the defaults) | **2293** | **56.1** | **2449** | **65.4** |
+| [2026&#8209;10&#8209;13](reports/2026-10-13.md) | `v16-097cf33d9-r50` + K1&nbsp;v3, F8&nbsp;v3.2, M4&nbsp;v2 | **1959** | 50.6 | **2397** | **66.2** |
+| [2026&#8209;10&#8209;15](reports/2026-10-15.md) | `v12-097cf33d9-r59` + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2 | **2197** | 50.4 | **2365** | **66.2** |
+| [2026&#8209;10&#8209;18](reports/2026-10-18.md) | `v12-097cf33d9-r59` + K1&nbsp;v3.2, F8&nbsp;v3.3, M4&nbsp;v2, mmvk&nbsp;v2 | **2207** | **53.8** | **2389** | **67.2** |
 | original | `v15-6050b467c-r156` | 1155 | 52.8 | 1384 | 57.9 |
-| [2026&#8209;10&#8209;28](PATCHES.md#change-log) | + K1&nbsp;v4, F8&nbsp;v5, M4&nbsp;v3, mmvk&nbsp;v3 (the defaults) | **2300** | **58.8** | **2467** | **61.0** |
-| original | `v16-6050b467c-r184` | 1163 | 53.4 | 1392 | 58.9 |
-| [2026&#8209;10&#8209;31](PATCHES.md#change-log) | + K1&nbsp;v7, F8&nbsp;v5, M4&nbsp;v4, mmvk&nbsp;v4 (the defaults) | **2508** | **59.4** | **2530** | **61.8** |
-| original | `v16-6050b467c-r195` | 1155 | 53.4 | 1388 | 58.7 |
-| [2026&#8209;11&#8209;01](PATCHES.md#change-log) | + K1&nbsp;v7, F8&nbsp;v5, M4&nbsp;v4, mmvk&nbsp;v4 (the defaults) | **2510** | **59.4** | **2531** | **61.2** |
+| [2026&#8209;11&#8209;01](PATCHES.md#change-log) | `v16-6050b467c-r195` + K1&nbsp;v7, F8&nbsp;v5, M4&nbsp;v4, mmvk&nbsp;v4 (the defaults) | **2510** | **59.4** | **2531** | **61.2** |
 
-Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.  From r144 to r156 the time per decode step did not change (MXFP4:
-43.35 / 43.21 ms with the patches); the decode figures moved with the draft acceptance, as the generated text changed.
+Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
 ## Build
 
