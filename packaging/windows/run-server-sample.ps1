@@ -1,4 +1,4 @@
-# Starts llama-server from this package with the settings we use on an R9700 (gfx1201).  Written with Claude (AI), after
+# Starts llama-server from this package with the settings of the measurements on an R9700 (gfx1201).  Written with Claude (AI), after
 # roger's own launcher.  A sample: fill in the two paths below (here or in a copy), then run it in PowerShell:
 #   .\run-server-sample.ps1
 # Anything you add after it goes to llama-server as it is (.\run-server-sample.ps1 --ctx-size 65536);
@@ -9,7 +9,7 @@ $modelPath = "C:\models\Qwen3.8-27B-UD-Q4_K_XL.gguf"
 # For any other model set it to "" (no speculative decoding).
 $draftPath = "C:\models\Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 
-# ---- the settings we use; nothing to edit below ----
+# ---- the settings of the measurements ----
 $PSNativeCommandUseErrorActionPreference = $false
 $here = $PSScriptRoot
 # hipBLASLt does not find its kernels by itself on Windows: the gfx1201 folder of this package
@@ -39,12 +39,7 @@ if ($draftPath) {
         "--model-draft", $draftPath
         "--n-gpu-layers-draft", "99"
         "--spec-draft-n-max", "5"
-        # n-gram drafts from the current prompt first (patch 0014: whole-file rewrites go much faster), DFlash2 when there is no hit;
-        # for DFlash2 alone: "--spec-type", "draft-dflash" and no --spec-ngram-mod-* lines
-        "--spec-type", "ngram-mod,draft-dflash"
-        "--spec-ngram-mod-n-max", "15"
-        "--spec-ngram-mod-n-min", "1"
-        "--spec-ngram-mod-n-match", "30"
+        "--spec-type", "draft-dflash"
         # sampled drafts, verified exactly by rejection sampling (llama.cpp's own; matters at temperature > 0)
         "--spec-draft-sampling", "probabilistic"
     )

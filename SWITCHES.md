@@ -21,7 +21,7 @@ the command in bash, `$env:NAME = "value"` in PowerShell).
 | `LLAMA_SPEC_LENIENCE`<br>(default off, `1`) | 0007 | a number between 0 and 1 | **Lossy.**  With sampled drafts (llama.cpp's own `--spec-draft-sampling probabilistic`) and a request temperature above 0, a drafted token is accepted with probability min(1, p / (l·q)) instead of min(1, p / q); the rest of the verification is unchanged, so no token becomes more than 1/l times as likely as under the model.  The request field `spec_lenience` sets it per request.  Has no effect at temperature 0 or with greedy drafts.  See the [2026-10-27 report](reports/2026-10-27.md) for what `0.8663` did to speed and quality. |
 | `GGML_GLU_INPLACE`<br>(default on) | 0008 | `1`, `0` | The graph allocator may give a GLU (SwiGLU, GEGLU, ...) the memory of its gate when nothing else reads the gate, so an FFN's gate, up and GLU output are not all live at once: 150 MiB less compute buffer at `-ub 2048` on Qwen3.8-27B.  Same output. |
 | `GGML_CUDA_FA_BAND_SPLIT`<br>(default on) | 0009 | `1`, `0` | RDNA4: a draft-verification batch of 9 to 16 query rows (two slots of a unified KV cache verifying at once, or an n-gram draft longer than 7) runs its attention as two halves of at most 8 rows through the decode / verify kernel instead of the generic one.  Each row gets the result a batch of 8 rows or fewer gives (not bit-identical to the generic kernel).  Only with `-fa on`, from `GGML_CUDA_FA_BAND_SPLIT_MIN_KV` KV cells (default `8192`; `0` = any length): below that the two launches cost more than they save. |
-| `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | 0012 | `1`, `2`, `0` | DFlash2 drafts each sequence's own width (from 3 to `--spec-draft-n-max`) from running acceptance estimates; the output does not change.  `2` also logs the width changes and, per request, the verifications per width.  `0`: the fixed width.  `LLAMA_DFLASH_ADAPTIVE_COST` (`0.035`) and `LLAMA_DFLASH_ADAPTIVE_JUMP` (`0.08`) set the cost model. |
+| `LLAMA_DFLASH_ADAPTIVE`<br>(default on) | 0012 | `1`, `2`, `0` | DFlash2 drafts each sequence's own width (from 3 to `--spec-draft-n-max`) from running acceptance estimates; the output does not change.  `2` also logs the width changes and, per request, the verifications per width.  `0`: the fixed width.  `LLAMA_DFLASH_ADAPTIVE_COST` (`0.035`) and `LLAMA_DFLASH_ADAPTIVE_JUMP` (`0.08`) are the constants of its fixed cost model; nothing is timed while running. |
 | `GGML_CUDA_GDN_NT`<br>(default on) | 0013 | `1`, `0` | The Gated DeltaNet verify kernel (qwen35 / qwen35moe, draft verification) reads the recurrent state and writes its per-token snapshots with non-temporal hints, so they do not push the next matmuls' weights out of the cache.  Same values. |
 | `LLAMA_RS_ANCHOR`<br>(default on) | 0013 | `1`, `0` | qwen35 / qwen35moe with drafts: each slot keeps two recurrent-state planes (after its last batch, and the one that batch started from) and the batch's per-token replay factors instead of one full state per draft token; a partly rejected draft is replayed from the start state.  Same output; about 1 GiB less VRAM with 2 slots (0.5 GiB with 1), slightly faster.  Needs every recurrent layer on the CPU or a CUDA / ROCm GPU (otherwise the log says it is off).  Before v3 (0013 v2) it was off unless set to `1`. |
 | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>(default on) | 0014 | `1`, `0` | Only with `ngram-mod`.  Each sequence looks up n-gram drafts only in its current prompt, in its own table with a key check; generated tokens are not added.  `0`: upstream's shared table without the check. |
@@ -39,10 +39,10 @@ for them.  0007 changes only how sampled drafts are accepted; 0012, 0014 and 001
 |---|---|
 | `-ub 2048 -b 2048` | K1 is fastest on large batches (2048), and needs at least 1024 tokens on small weights.  The main model's compute buffer grows by about 1.1 MiB per ubatch token: lower it (e.g. 1536) if a long context does not fit. |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 runs only on a q8_0 KV cache with flash attention. |
-| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` | Only for 0014: an n-gram type before DFlash2.  Without it 0014 does nothing. |
+| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` | Only for 0014: an n-gram type before DFlash2.  Without it 0014 does nothing; the example command has none. |
 | `--spec-draft-sampling probabilistic` | Only for 0007.  llama.cpp's own parameter: sample the draft and verify it by rejection sampling (exact).  Faster on sampled code / math at temperature 0.7-1.0, can be slower at low temperature: measure on your own workload. |
 
-The whole command we run (draft model): [README](README.md#run).
+The example command (draft model): [README](README.md#run).
 
 ## Turning everything off
 
@@ -99,7 +99,7 @@ turns on F8 alone).
 | `LLAMA_SPEC_LENIENCE`<br>（預設關，`1`） | 0007 | 0 到 1 之間的數字 | **有損。** 使用抽樣草稿（llama.cpp 自己的 `--spec-draft-sampling probabilistic`）且請求溫度大於 0 時，草稿字的接受機率從 min(1, p/q) 改成 min(1, p/(l·q))；驗證的其餘部分不變，所以任何字的機率最多變成原本的 1/l 倍。請求欄位 `spec_lenience` 可逐請求設定。溫度 0 或 greedy 草稿時沒有作用。`0.8663` 對速度與品質的影響見 [2026-10-27 報告](reports/2026-10-27.md)。 |
 | `GGML_GLU_INPLACE`<br>（預設開） | 0008 | `1`、`0` | 圖配置器可以讓 GLU（SwiGLU、GEGLU…）在 gate 沒有其他讀取者時直接寫進 gate 的記憶體，FFN 的 gate、up、GLU 輸出就不會同時存在：Qwen3.8-27B 在 `-ub 2048` 時計算緩衝區少 150 MiB。輸出相同。 |
 | `GGML_CUDA_FA_BAND_SPLIT`<br>（預設開） | 0009 | `1`、`0` | RDNA4：9～16 個查詢列的草稿驗證批次（unified KV 下兩個 slot 同時驗證，或 n-gram 草稿超過 7 個 token）把注意力切成兩半、每半最多 8 列，走 decode／驗證用的 kernel，而不是一般 kernel。每一列得到的結果和 8 列以下的批次相同（和一般 kernel 不逐位元相同）。只在 `-fa on`、KV 達 `GGML_CUDA_FA_BAND_SPLIT_MIN_KV` 格（預設 `8192`；`0` 為不限長度）時作用：更短時兩次發射的成本大於省下的。 |
-| `LLAMA_DFLASH_ADAPTIVE`<br>（預設開） | 0012 | `1`、`2`、`0` | DFlash2 依照持續更新的接受率估計，為每個序列各自選草稿寬度（3 到 `--spec-draft-n-max`）；輸出不變。`2` 另外記錄寬度變化，以及每個請求在各寬度的驗證次數。`0`：固定寬度。成本模型用 `LLAMA_DFLASH_ADAPTIVE_COST`（`0.035`）與 `LLAMA_DFLASH_ADAPTIVE_JUMP`（`0.08`）設定。 |
+| `LLAMA_DFLASH_ADAPTIVE`<br>（預設開） | 0012 | `1`、`2`、`0` | DFlash2 依照持續更新的接受率估計，為每個序列各自選草稿寬度（3 到 `--spec-draft-n-max`）；輸出不變。`2` 另外記錄寬度變化，以及每個請求在各寬度的驗證次數。`0`：固定寬度。`LLAMA_DFLASH_ADAPTIVE_COST`（`0.035`）與 `LLAMA_DFLASH_ADAPTIVE_JUMP`（`0.08`）是固定成本模型的常數；執行時不計時。 |
 | `GGML_CUDA_GDN_NT`<br>（預設開） | 0013 | `1`、`0` | Gated DeltaNet 的驗證 kernel（qwen35／qwen35moe 的草稿驗證）讀遞迴狀態、寫每個 token 的快照時用 non-temporal 提示，不把接下來矩陣乘的權重擠出快取。數值相同。 |
 | `LLAMA_RS_ANCHOR`<br>（預設開） | 0013 | `1`、`0` | qwen35／qwen35moe 搭配草稿時：每個 slot 只留兩個遞迴狀態平面（上一批之後的狀態、該批開始時的狀態）和該批每個 token 的重播因子，而不是每個草稿 token 一份完整狀態；草稿只接受一部分時，從開始時的狀態重播。輸出相同；2 slot 約省 1 GiB 顯存（1 slot 約 0.5 GiB），速度略快。所有遞迴層要放在 CPU 或 CUDA／ROCm GPU 上（否則 log 會說它關了）。v3 以前（0013 v2）不設成 `1` 就是關。 |
 | `LLAMA_SPEC_NGRAM_PROMPT_ONLY`<br>（預設開） | 0014 | `1`、`0` | 只在用 `ngram-mod` 時作用。每個序列只從本次提示查 n-gram 草稿，用自己的表並核對 key；生成的內容不加進表裡。`0`：上游共用、不核對的表。 |
@@ -116,10 +116,10 @@ turns on F8 alone).
 |---|---|
 | `-ub 2048 -b 2048` | K1 在大批次（2048）最快；小權重至少要 1024 token。主模型的計算暫存區每個 ubatch token 約 1.1 MiB：長上下文放不下時可以降低（例如 1536）。 |
 | `-fa on -ctk q8_0 -ctv q8_0` | F8 只在 flash attention＋q8_0 KV 快取上作用。 |
-| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` | 只有 0014 需要：n-gram 類型放在 DFlash2 前面。沒有它，0014 不會作用。 |
+| `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30` | 只有 0014 需要：n-gram 類型放在 DFlash2 前面。沒有它，0014 不會作用；範例指令沒有它。 |
 | `--spec-draft-sampling probabilistic` | 只有 0007 需要。llama.cpp 自己的參數：草稿改為抽樣，以拒絕取樣驗證（無損）。溫度 0.7～1.0 的寫程式／數學變快，低溫時可能變慢：請用自己的工作負載實測。 |
 
-我們實際使用的完整指令（草稿模型）：見 [README](README.md#run)。`--spec-type`、`--spec-ngram-mod-n-max`／`-n-min` 都是上游 llama.cpp 的參數（預設 64／48）；rdna-boosts 會把長度夾到 15、最短也跟著變 15，不設的話只會用到剛好 15 個 token 的 n-gram 草稿，所以我們設最短 8。DFlash2 草稿模型只適用 Qwen3.8-27B（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，Q4_K_M）。Windows 打包版附 `run-server-sample.ps1`，只要填模型路徑。
+範例指令（草稿模型）：見 [README](README.md#run)，不含 n-gram。`--spec-type`、`--spec-ngram-mod-n-max`／`-n-min` 都是上游 llama.cpp 的參數（預設 64／48）；rdna-boosts 會把長度夾到 15，沒設 `-n-min` 時最短也是 15。DFlash2 草稿模型只適用 Qwen3.8-27B（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，Q4_K_M）。Windows 打包版附 `run-server-sample.ps1`，只要填模型路徑。
 
 ## 全部關掉
 

@@ -32,7 +32,8 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 
 What each patch does, what it needs, the types, and the change log: [PATCHES.md](PATCHES.md).
 
-All are on by default except `0007`; `GGML_LF_ALL=0` turns off every switch left unset ([SWITCHES.md](SWITCHES.md)).
+Every patch can be turned off with its switch; left unset, all are on except `0007`, and `GGML_LF_ALL=0` turns off every
+switch left unset ([SWITCHES.md](SWITCHES.md)).
 Prefill speed-ups measured on Linux, R9700, Qwen3.8-27B UD-Q4_K_XL, DFlash2 draft, 8K / 32K prompt, on `v16-a55e952b8-r8`; `0001` v7 is
 faster since (+7.8 % at depth 0, +4.7 % at 32K on 2048-token batches, the same output); KLD measured on r144 ([2026-10-27 report](reports/2026-10-27.md)):
 
@@ -119,15 +120,15 @@ Q5 = official UD-Q5_K_M; MXFP4 = FreedomAISVR MXFP4.
 
 ## Run
 
-The patches are on by default.  Speculative decoding, which gives much of the generation speed, needs a draft model and
-these server parameters; this is what we run on an R9700 with Qwen3.8-27B (Linux; on Windows the same in PowerShell,
-without `HSA_USERPTR_FOR_PAGED_MEM` and with `--poll 0`):
+The patches are on by default; each can be turned off with its switch.  Speculative decoding needs a draft model and
+these server parameters.  An example command, the one behind the measurements here (R9700, Qwen3.8-27B, Linux; on
+Windows the same in PowerShell, without `HSA_USERPTR_FOR_PAGED_MEM` and with `--poll 0`):
 
 ```bash
 HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 99 -c 131072 --kv-unified \
   -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 \
   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf -ngld 99 --spec-draft-n-max 5 \
-  --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30 \
+  --spec-type draft-dflash \
   --spec-draft-sampling probabilistic
 ```
 
@@ -136,18 +137,24 @@ HSA_USERPTR_FOR_PAGED_MEM=0 ./llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl 9
 - `-md ... -ngld 99 --spec-draft-n-max 5`: the DFlash2 draft model, for Qwen3.8-27B only
   ([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), Q4_K_M).  With any other
   model leave out the last three lines.
-- `--spec-type ngram-mod,draft-dflash ...`: n-gram drafts from the current prompt (`0014`), and DFlash2 when there is no
-  hit.  Against DFlash2 alone (`--spec-type draft-dflash`, which also saves the 32 MiB per sequence of `0014`'s table):
-  whole-file edits +33..+66 %, other requests about the same, one long English continuation -4 % (Qwen3.8-27B, one request
-  at a time).  The parameters are upstream's; rdna-boosts clamps the length to 15.
+- `--spec-type draft-dflash`: DFlash2 drafts.  `0014` acts only with an n-gram type
+  ([SWITCHES.md](SWITCHES.md#server-parameters-they-need)).
 - `--spec-draft-sampling probabilistic`: llama.cpp's own; sampled drafts, verified exactly by rejection sampling (it
   matters at temperature > 0).  `0007` (`LLAMA_SPEC_LENIENCE`, lossy, off by default) builds on it.
 - `HSA_USERPTR_FOR_PAGED_MEM=0`: Linux only ([Switches](#switches)).
 - `--poll 0`: Windows.  The Windows build has no OpenMP, so llama.cpp's own CPU thread pool spins after the CPU part of
   every step: on a Ryzen 7 5700G with an R9700 the server used 4.2-4.4 cores while generating, 0.85-0.91 with
   `--poll 0`, at the same speed and with the same text.  The Linux build uses OpenMP and does not need it.
-- The Windows package of the [GitHub Actions workflow](.github/workflows/windows-gfx1201.yml) comes with
-  [`run-server-sample.ps1`](packaging/windows/run-server-sample.ps1): these settings, with the two model paths to fill in.
+- The [GitHub Actions workflow](.github/workflows/windows-gfx1201.yml) can build a Windows package when it is run by hand
+  (no package is published here); it includes [`run-server-sample.ps1`](packaging/windows/run-server-sample.ps1): these
+  settings, with the two model paths to fill in.
+
+## Use
+
+These patches are offered for research and evaluation.  Every patch can be turned off with its switch
+([SWITCHES.md](SWITCHES.md)).  Users are responsible for checking the rights that apply where they use them.
+
+本 repo 的 patch 供研究與評估。每個 patch 都能用它的開關關掉（[SWITCHES.md](SWITCHES.md)）。使用者請自行確認所在地適用的權利。
 
 ## Thanks
 

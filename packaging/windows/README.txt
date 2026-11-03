@@ -9,8 +9,8 @@ yourself (BUILD-windows.md in the repository; an AI assistant can do it for you)
 Run
 ---
 
-The patches' speed-ups are on by default.  Speculative decoding (much of the generation speed) needs a draft model and
-server parameters; run-server-sample.ps1 has them.  Open it (or a copy of it) in a text editor, fill in the two paths at
+The patches are on by default; each can be turned off with its switch (SWITCHES.md).  Speculative decoding needs a draft
+model and server parameters; run-server-sample.ps1 has them.  Open it (or a copy of it) in a text editor, fill in the two paths at
 the top (the model, and the DFlash2 draft model), then in PowerShell, in this folder:
 
     .\run-server-sample.ps1
@@ -24,18 +24,20 @@ the top (the model, and the DFlash2 draft model), then in PowerShell, in this fo
   powershell -ExecutionPolicy Bypass -File .\run-server-sample.ps1
 - If HIP also sees the CPU's integrated GPU (the log says "found 2 ROCm devices"), run $env:HIP_VISIBLE_DEVICES = "0"
   (the R9700's index) first, or the fp8 prefill (K1) stays off.
-- The log should show "K1 warm-up (2048 tokens, ...): fp8 GEMM ready".
-- Optional, lossy: $env:LLAMA_SPEC_LENIENCE = "0.8663" keeps more sampled-draft tokens at temperature > 0 (SWITCHES.md).
+- With K1 on, the log shows "K1 warm-up (2048 tokens, ...): fp8 GEMM ready".
+- 0007 is off by default (SWITCHES.md).
 
 Without the script:
 
     $env:HIPBLASLT_TENSILE_LIBPATH = ".\gfx1201"
     .\llama-server.exe -m <model.gguf> -ngl 99 -c 131072 -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 --kv-unified `
       -md <Qwen3.8-27B-DFlash2-Q4_K_M.gguf> -ngld 99 --spec-draft-n-max 5 `
-      --spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 1 --spec-ngram-mod-n-match 30 `
-      --spec-draft-sampling probabilistic --poll 0
+      --spec-type draft-dflash --spec-draft-sampling probabilistic --poll 0
 
 All switches: SWITCHES.md in the repository.
+
+These patches are offered for research and evaluation.  Every patch can be turned off with its switch.  Users are
+responsible for checking the rights that apply where they use them.
 
 Check the download
 ------------------
@@ -56,7 +58,7 @@ llama.cpp＋llama-cpp-rdna-boosts＋本 repo 的 patch，只為 gfx1201 編譯�
 hipBLASLt kernel。其他顯卡請直接用 rdna-boosts（本包的加速只在 RDNA4 上作用）。RX 9060 XT（gfx1200）也是 RDNA4，但沒測過，
 請自行編譯（repo 裡的 BUILD-windows.md；可以請 AI 助理代勞）。
 
-執行：patch 的加速預設就開。推測解碼（生成速度的一大部分）需要草稿模型與 server 參數，run-server-sample.ps1 裡都設好了。
+執行：patch 預設就開，每個都能用它的開關關掉（SWITCHES.md）。推測解碼需要草稿模型與 server 參數，run-server-sample.ps1 裡都設好了。
 用文字編輯器打開 run-server-sample.ps1（或它的複本），填好開頭的兩個路徑（模型、DFlash2 草稿模型），再在這個資料夾開 PowerShell：
 
     .\run-server-sample.ps1
@@ -69,9 +71,10 @@ hipBLASLt kernel。其他顯卡請直接用 rdna-boosts（本包的加速只在 
   powershell -ExecutionPolicy Bypass -File .\run-server-sample.ps1
 - HIP 也看到 CPU 內顯時（log 出現 "found 2 ROCm devices"），先執行 $env:HIP_VISIBLE_DEVICES = "0"（R9700 的編號），
   否則 fp8 prefill（K1）不會開。
-- log 要出現 "K1 warm-up (2048 tokens, ...): fp8 GEMM ready"。
-- 選用、有損：$env:LLAMA_SPEC_LENIENCE = "0.8663" 在溫度大於 0 時多收一些抽樣草稿（見 SWITCHES.md）。
+- K1 開著時，log 會出現 "K1 warm-up (2048 tokens, ...): fp8 GEMM ready"。
+- 0007 預設關（見 SWITCHES.md）。
 
 不用腳本時的完整指令見上方英文段落。下載檢查：zip 的 SHA-256 要和 .sha256 檔相同；有 GitHub CLI 可再跑
 gh attestation verify <zip> --repo overdoingism/llama-cpp-overdoing。授權見 LICENSES.txt，不提供任何保證。
+本包的 patch 供研究與評估；每個 patch 都能用它的開關關掉；使用者請自行確認所在地適用的權利。
 本說明由 Claude（AI）撰寫。
