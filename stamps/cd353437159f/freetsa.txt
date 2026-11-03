@@ -1,0 +1,19 @@
+Status info:
+Status: Granted.
+Status description: unspecified
+Failure info: unspecified
+
+TST info:
+Version: 1
+Policy OID: tsa_policy1
+Hash Algorithm: sha256
+Message data:
+    0000 - a0 48 ba db 2d 86 48 a5-3e a8 7d b2 f2 12 73 62   .H..-.H.>.}...sb
+    0010 - c2 e8 5f 4d c4 7b 6a 1a-64 48 eb d9 8a 17 01 28   .._M.{j.dH.....(
+Serial number: 0x09B1A605
+Time stamp: Nov  3 16:27:59 2026 GMT
+Accuracy: unspecified
+Ordering: yes
+Nonce: 0x04BEBC4D00BFE96F
+TSA: DirName:/O=Free TSA/OU=TSA/description=This certificate digitally signs documents and time stamp requests made using the freetsa.org online services/CN=www.freetsa.org/emailAddress=busilezas@mailbox.org/L=Wuerzburg/C=DE/ST=Bayern
+Extensions:
