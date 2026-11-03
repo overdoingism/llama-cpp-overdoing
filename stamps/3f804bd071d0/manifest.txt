@@ -1,0 +1,36 @@
+# llama-cpp-overdoing public manifest: commit 3f804bd071d08ccf19c321864f11132b36aad2ef, tree b4db5c2e046a480f47a6f9bb31648be0d86607f6, committed 2026-11-03T21:16:43+08:00
+# made 2026-11-03T23:18:16+08:00; sha256 of `git archive --format=tar <commit>` and of each file at the commit
+# entries 33
+ef3e0a86dc96510f963a043c774f54e846fa4501bf8dd09e451e1feba2b5ec60  archive:3f804bd071d08ccf19c321864f11132b36aad2ef
+07e2183ffd6419530c6512abfe409396463a4b44bd282d84bdc9c3380323082e  file:.github/workflows/windows-gfx1201.yml
+c1788395bc5566f18e324bc33e108d9119986c95aa978627109d976b7334f886  file:BUILD-linux.md
+516fadb7962bb0189efcc13ae1bdfe12cfe9eec978df652ea519baa9722afe74  file:BUILD-windows.md
+8b91495807ffa56a883556af87f9a82adf3f09e377231e036a5cf4f55c01ba47  file:LICENSE
+1a8267b621e7074d98d23153a61c4033b7013ed6680c422e9d08ca5bbafe2350  file:PATCHES.md
+4a987a471f56372f64004d0bed974ce48acaf28ada0bd08c5eb8d9ba7bd6447b  file:README.md
+8451138f68ebb1bff547a1a660fdc5878b3ac160c95b2eaf8697eba2a33b6f8b  file:SWITCHES.md
+5fc5fe502e13f6a20f8b24a06b93d88f6ab0de123da48d021fd51a37401efa53  file:packaging/windows/LICENSES.txt
+31c8793435347d459f4f37390150f442255f8d5c9311de03661a53c171806110  file:packaging/windows/README.txt
+401d2fb7b441dcb8fd406296c8c49006a5b2848125ca2ace03d1ad5f15d35b07  file:packaging/windows/package.ps1
+dc138a6273f4884a56eec267cee7a43a1de59b55a3089de1536fef63157d6435  file:packaging/windows/run-server-sample.ps1
+5c0a570a7268effc8013160b9f6cfe617a7db4e8dbb921469419cb1392c5dbf1  file:patches/0001-605-k1-v7.patch
+2171d82fe77f18548fbe2a77a877568de48680808f342665e783208c1bdea3e7  file:patches/0002-605-f8-v6.patch
+bccd53ada1d81efa1bc3f2be067cb8d49448838be32ecd75a7143f9e015d2e55  file:patches/0003-605-m4-v4.patch
+86a0fe19ebe73e77e378151a626c2312db5166b10ec58720819b5ca1e9cbb97a  file:patches/0004-605-reasoning-guard-v2.patch
+bf73a72a6ab00dc76ad6d8d7acf75888c3ef2af8bf1bb95d031585704e4080dd  file:patches/0005-605-state-bands-v1.patch
+55ea73077c959315a5fc2f760f5baf6be6bf48e6f5da8d4e1c0d9b02fbb91d33  file:patches/0006-605-mmvk-v4.patch
+0a26f68cad83b4a7203a49c16287b2cbc5fc38b0e870846943647a6e6a8064e6  file:patches/0007-605-spec-lenience-v1.patch
+cee7968e7735216b698d2f75437d45edf136b6b3fcb42ee91c21a37ab43bfd97  file:patches/0008-605-glu-inplace-v1.patch
+30de89f3cf543bb77ce1fa54727475b2e0f740c279851d870d8e88808b8b2675  file:patches/0009-605-fa-band-split-v1.patch
+fc2b246da12d9277d6def315884b85116b78f3c87f75819d434f33b265b7dfdf  file:patches/0012-605-dflash-adaptive-width-v2.patch
+31422fcb83b6a56efa89bdcd87c1c36d980efb89021a4ca1d221ed27fd564763  file:patches/0013-605-gdn-verify-anchor-v4.patch
+e7564296037c72ef2b5cc1883655da9fecf355fd4734d964b317c5bf5b14e80a  file:patches/0014-605-ngram-prompt-only-v2.patch
+37f6ece8034698673ab036841d89f4ea078fb54a8ca8dc9c937faf8328339037  file:patches/0015-605-spec-align-v4.patch
+6d7f4018277e3de1f92ab2216319fd9d82132a2f502575eee1bdf88b5575b89d  file:reports/2026-10-07.md
+b1fcc0f6eecc93e076c7234d54ad30e29aa1f07df58fdb7ab1bfb4580a8116bb  file:reports/2026-10-12.md
+f490d9b0995c21a45b188ac122244a8e671a4180d68520358c5f6165fd4d2a3d  file:reports/2026-10-13.md
+771de3c3ac770af723f16cb0b8e5b91607911ff440719d6c14f1d10a16fb47aa  file:reports/2026-10-15.md
+bbf6727702b3b3f7d2d2378335e1e3cbb76520d712d135474497104fa807dd0e  file:reports/2026-10-18.md
+320d9f1100bbade0e451db7a34a2d3fd949a77ead0ac29384515b0602cecf645  file:reports/2026-10-19.md
+fbb17882de20eeb56562a42e4f97c2eb93211f905b3ebdddd4a7ef9532e59967  file:reports/2026-10-24.md
+90afefe3f5c6cf55fe1e436806c2e94b6cbd7ec4b033ae730337c2e12002f7ca  file:reports/2026-10-27.md
