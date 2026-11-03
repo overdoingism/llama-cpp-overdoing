@@ -1,8 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
-Date: Tue, 27 Oct 2026 05:40:20 +0800
-Subject: [PATCH] F8 v5: flash-attention prefill in fp8, on by default; the row
- sum counts the probabilities as fp8
+Date: Tue, 3 Nov 2026 20:58:10 +0800
+Subject: [PATCH] F8 v6: flash-attention prefill in fp8, on by default;
+ LDS-only barriers, WMMAs of two accumulators in turn
+
+v6: in lf_fa_attn most WMMAs of a tile came right after the WMMA that wrote their accumulator (QK: 16 in a row per
+accumulator, PV: 4), so each waited for the one before.  Where it was measured faster on gfx1201 -- head 128, head 256
+with 4 or more waves, head 64 with up to 3 -- QK and PV now issue the WMMAs of two accumulators in turn; the other shapes
+keep the previous order (two accumulators were up to 11% slower at head 64 with 4+ waves, and spill in the loop at head
+256 with 2-3).  Every accumulator adds its products in the same order, so the output is unchanged.  The tile loop's
+barriers order LDS only (after radiance's lds_barrier, Apache-2.0): __syncthreads() also invalidated the vector cache.
+gfx1201 (R9700), against v5: bit-identical on 120 test-backend-ops cases (GQA 1..8, head 64/128/256, f16 and derived
+masks, n_q 64..2048).  2048-token batch, kv 8K / 32K, every GQA 1..8 x head 64/128/256: -0.4 % to +6.6 % (head 128
++0.8 to +4.3 %, Llama-3-8B-like 8 kv heads x GQA 4 x head 128 +4.1 / +4.3 %).  Qwen3.8-27B (GQA 6, head 256): +2.7 to
++4.3 % at 8K..110K; llama-bench pp2048 at depth 32768 2270 -> 2282 t/s, at 110592 1559 -> 1569 t/s.
 
 v5: the row sum l added the fp32 probabilities while O = V^T P^T multiplied their fp8 conversions.  A probability below
 the smallest fp8 subnormal (about 2^-18 of the row's running max, after the 2^8 scale) became 0 in O but still counted
@@ -24,11 +35,11 @@ cell for the amax and the conversion; each query's own mask row still decides wh
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- ggml/src/ggml-cuda/common.cuh    |  23 ++
+ ggml/src/ggml-cuda/common.cuh    |  23 +
  ggml/src/ggml-cuda/fattn.cu      |   6 +
- ggml/src/ggml-cuda/lf-fa-fp8.cu  | 637 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/lf-fa-fp8.cu  | 707 +++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/lf-fa-fp8.cuh |  12 +
- 4 files changed, 678 insertions(+)
+ 4 files changed, 748 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cu
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cuh
 
@@ -95,10 +106,10 @@ index 38134c491..8778b27c7 100644
              GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cu b/ggml/src/ggml-cuda/lf-fa-fp8.cu
 new file mode 100644
-index 000000000..e6692ee4c
+index 000000000..c08f11259
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-fa-fp8.cu
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,707 @@
 +#include "lf-fa-fp8.cuh"
 +
 +#include <algorithm>
@@ -135,7 +146,6 @@ index 000000000..e6692ee4c
 +typedef int   lf_v4i __attribute__((ext_vector_type(4)));
 +
 +// software pipeline for a run of NLOAD LDS operand loads each feeding 2 WMMAs: keep one load ahead
-+// (sched_group_barrier masks: 0x100 = DS read, 0x008 = MFMA/WMMA)
 +template <int NLOAD>
 +static __device__ __forceinline__ void lf_pipe_ds_wmma() {
 +    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0);
@@ -146,6 +156,35 @@ index 000000000..e6692ee4c
 +    }
 +    __builtin_amdgcn_sched_group_barrier(0x008, 4, 0);
 +}
++
++// software pipeline for NGRP groups of NL LDS operand loads, each group feeding 2*NL WMMAs into NL different
++// accumulators: the next group's loads go between the first and the second half of the current group's WMMAs
++// (sched_group_barrier masks: 0x100 = DS read, 0x008 = MFMA/WMMA)
++template <int NGRP, int NL>
++static __device__ __forceinline__ void lf_pipe_ds_wmma_grp() {
++    __builtin_amdgcn_sched_group_barrier(0x100, NL, 0);
++#pragma unroll
++    for (int i = 0; i < NGRP - 1; ++i) {
++        __builtin_amdgcn_sched_group_barrier(0x008, NL, 0);
++        __builtin_amdgcn_sched_group_barrier(0x100, NL, 0);
++        __builtin_amdgcn_sched_group_barrier(0x008, NL, 0);
++    }
++    __builtin_amdgcn_sched_group_barrier(0x008, 2 * NL, 0);
++}
++
++// a barrier that orders LDS only: __syncthreads() also invalidates the vector cache (global_inv), which the tile loop
++// does not need -- its global reads are of buffers no thread of the grid writes (after radiance's lds_barrier, Apache-2.0)
++static __device__ __forceinline__ void lf_lds_barrier() {
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
++    __builtin_amdgcn_s_barrier();
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
++}
++
++// The WMMAs of 2 accumulators go in turn (a WMMA right after the one that wrote its accumulator waits for it) where that
++// was measured faster on gfx1201: head 128, head 256 with 4 or more waves (with fewer, 2 accumulators spill in the loop),
++// head 64 with up to 3 waves (with more, up to 11% slower).  The other shapes keep one accumulator at a time.
++template <int G, int D>
++constexpr bool lf_interleave() { return D == 128 || (D == 256 && G >= 4) || (D == 64 && G <= 3); }
 +
 +// Operand-pair layout: along the reduction axis (K and Q: dims, V^T: keys) the 8-byte units of each 32-element group
 +// are stored as (step 0, half 0), (step 1, half 0), (step 0, half 1), (step 1, half 1), so the lane that reads half h
@@ -354,6 +393,7 @@ index 000000000..e6692ee4c
 +
 +// Block = one kv head x LF_QB tokens; wave g = Q head hk*G + g for those tokens.  Visibility: derived (cell_pos,
 +// tok_lo, tok_hi) or an f16 mask tensor (added), or none.  Writes a split's unnormalized O (x vs) and (max, sum).
++// QK and PV issue their WMMAs in the order lf_interleave() picks; each accumulator adds its products in the same order either way.
 +template <int G, int D>
 +__global__ void __launch_bounds__(G * 32, 1) lf_fa_attn(
 +        const uint8_t * __restrict__ q8, const float * __restrict__ qs,
@@ -389,6 +429,8 @@ index 000000000..e6692ee4c
 +        qa[2 * g2] = lf_v2i{q4.x, q4.y}; qa[2 * g2 + 1] = lf_v2i{q4.z, q4.w};
 +    }
 +    const float kqc = qs[(size_t) tq * HQ + h] * ks[hk] * scale_log2;  // score = kqc * (K8 . Q8), log2 domain
++    constexpr bool ORD  = lf_interleave<G, D>();
++    constexpr int  NACC = 2;
 +
 +    lf_v8f o[D / 16];
 +#pragma unroll
@@ -452,9 +494,29 @@ index 000000000..e6692ee4c
 +                }
 +            }
 +        }
-+        __syncthreads();
++        lf_lds_barrier();
 +
 +        lf_v8f s[LF_KT / 16];
++        if constexpr (ORD) {
++#pragma unroll
++        for (int ks0 = 0; ks0 < LF_KT / 16; ks0 += NACC) {
++#pragma unroll
++            for (int j = 0; j < NACC; ++j) s[ks0 + j] = lf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
++#pragma unroll
++            for (int g2 = 0; g2 < D / 32; ++g2) {
++                lf_v4i k4[NACC];
++#pragma unroll
++                for (int j = 0; j < NACC; ++j) k4[j] = *(const lf_v4i *) &Ks[((ks0 + j) * 16 + lane % 16) * LF_KS + g2 * 32 + (lane / 16) * 16];
++#pragma unroll
++                for (int j = 0; j < NACC; ++j)
++                    s[ks0 + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{k4[j].x, k4[j].y}, qa[2 * g2],     s[ks0 + j]);
++#pragma unroll
++                for (int j = 0; j < NACC; ++j)
++                    s[ks0 + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{k4[j].z, k4[j].w}, qa[2 * g2 + 1], s[ks0 + j]);
++            }
++        }
++        lf_pipe_ds_wmma_grp<(LF_KT / 16 / NACC) * (D / 32), NACC>();
++        } else {
 +#pragma unroll
 +        for (int ks_ = 0; ks_ < LF_KT / 16; ++ks_) {
 +            s[ks_] = lf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
@@ -466,6 +528,7 @@ index 000000000..e6692ee4c
 +            }
 +        }
 +        lf_pipe_ds_wmma<(LF_KT / 16) * (D / 32)>();
++        }
 +        float mt = -INFINITY;
 +        float cc = kqc;   // full tiles keep the raw dot products (scaled inside the exp2's fma); others are pre-scaled
 +        if (full) {
@@ -514,6 +577,23 @@ index 000000000..e6692ee4c
 +#pragma unroll
 +            for (int i = 0; i < D / 16; ++i) o[i] *= alpha;
 +        }
++        if constexpr (ORD) {
++#pragma unroll
++        for (int g2 = 0; g2 < LF_KT / 32; ++g2)
++#pragma unroll
++            for (int i0 = 0; i0 < D / 16; i0 += NACC) {
++                lf_v4i v4[NACC];
++#pragma unroll
++                for (int j = 0; j < NACC; ++j) v4[j] = *(const lf_v4i *) &Vs[((i0 + j) * 16 + lane % 16) * LF_VS + g2 * 32 + (lane / 16) * 16];
++#pragma unroll
++                for (int j = 0; j < NACC; ++j)
++                    o[i0 + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{v4[j].x, v4[j].y}, p8[2 * g2],     o[i0 + j]);
++#pragma unroll
++                for (int j = 0; j < NACC; ++j)
++                    o[i0 + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{v4[j].z, v4[j].w}, p8[2 * g2 + 1], o[i0 + j]);
++            }
++        lf_pipe_ds_wmma_grp<(LF_KT / 32) * (D / 16 / NACC), NACC>();
++        } else {
 +#pragma unroll
 +        for (int i = 0; i < D / 16; ++i)
 +#pragma unroll
@@ -523,7 +603,8 @@ index 000000000..e6692ee4c
 +                o[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(lf_v2i{v4.z, v4.w}, p8[2 * g2 + 1], o[i]);
 +            }
 +        lf_pipe_ds_wmma<(D / 16) * (LF_KT / 32)>();
-+        __syncthreads();
++        }
++        lf_lds_barrier();
 +    }
 +    l += __shfl_xor_sync(0xFFFFFFFF, l, 16, 32);
 +    if (tq >= n_q) return;
