@@ -1,15 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 20:58:10 +0800
-Subject: [PATCH] F8 v6: flash-attention prefill in fp8, on by default;
+Subject: [PATCH] F8 v7: flash-attention prefill in fp8, on by default;
  LDS-only barriers, WMMAs of two accumulators in turn
+
+v7: the tile loop's LDS-only barrier is written as the RDNA4 decode band's (flash_attn_ext_f16_iter_barrier in
+fattn-mma-f16.cuh), with its __syncthreads() fallback for other targets.  The gfx1201 code object is byte for byte the
+one of v6.
 
 v6: in lf_fa_attn most WMMAs of a tile came right after the WMMA that wrote their accumulator (QK: 16 in a row per
 accumulator, PV: 4), so each waited for the one before.  Where it was measured faster on gfx1201 -- head 128, head 256
 with 4 or more waves, head 64 with up to 3 -- QK and PV now issue the WMMAs of two accumulators in turn; the other shapes
 keep the previous order (two accumulators were up to 11% slower at head 64 with 4+ waves, and spill in the loop at head
 256 with 2-3).  Every accumulator adds its products in the same order, so the output is unchanged.  The tile loop's
-barriers order LDS only (after radiance's lds_barrier, Apache-2.0): __syncthreads() also invalidated the vector cache.
+barriers order LDS only: __syncthreads() also invalidated the vector cache.
 gfx1201 (R9700), against v5: bit-identical on 120 test-backend-ops cases (GQA 1..8, head 64/128/256, f16 and derived
 masks, n_q 64..2048).  2048-token batch, kv 8K / 32K, every GQA 1..8 x head 64/128/256: -0.4 % to +6.6 % (head 128
 +0.8 to +4.3 %, Llama-3-8B-like 8 kv heads x GQA 4 x head 128 +4.1 / +4.3 %).  Qwen3.8-27B (GQA 6, head 256): +2.7 to
@@ -37,9 +41,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  ggml/src/ggml-cuda/common.cuh    |  23 +
  ggml/src/ggml-cuda/fattn.cu      |   6 +
- ggml/src/ggml-cuda/lf-fa-fp8.cu  | 707 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/lf-fa-fp8.cu  | 712 +++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/lf-fa-fp8.cuh |  12 +
- 4 files changed, 748 insertions(+)
+ 4 files changed, 753 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cu
  create mode 100644 ggml/src/ggml-cuda/lf-fa-fp8.cuh
 
@@ -106,10 +110,10 @@ index 38134c491..8778b27c7 100644
              GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cuda/lf-fa-fp8.cu b/ggml/src/ggml-cuda/lf-fa-fp8.cu
 new file mode 100644
-index 000000000..c08f11259
+index 000000000..f28a4fe53
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/lf-fa-fp8.cu
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,712 @@
 +#include "lf-fa-fp8.cuh"
 +
 +#include <algorithm>
@@ -172,12 +176,17 @@ index 000000000..c08f11259
 +    __builtin_amdgcn_sched_group_barrier(0x008, 2 * NL, 0);
 +}
 +
-+// a barrier that orders LDS only: __syncthreads() also invalidates the vector cache (global_inv), which the tile loop
-+// does not need -- its global reads are of buffers no thread of the grid writes (after radiance's lds_barrier, Apache-2.0)
-+static __device__ __forceinline__ void lf_lds_barrier() {
++// The tile loop's barriers only order shared-memory accesses, as the RDNA4 decode band's do (flash_attn_ext_f16_iter_barrier
++// in fattn-mma-f16.cuh): its global reads are of buffers no thread of the grid writes, and __syncthreads() would also
++// invalidate the vector cache.
++static __device__ __forceinline__ void lf_fa_iter_barrier() {
++#if defined(AMD_WMMA_AVAILABLE)
 +    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
 +    __builtin_amdgcn_s_barrier();
 +    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
++#else
++    __syncthreads();
++#endif // defined(AMD_WMMA_AVAILABLE)
 +}
 +
 +// The WMMAs of 2 accumulators go in turn (a WMMA right after the one that wrote its accumulator waits for it) where that
@@ -494,7 +503,7 @@ index 000000000..c08f11259
 +                }
 +            }
 +        }
-+        lf_lds_barrier();
++        lf_fa_iter_barrier();
 +
 +        lf_v8f s[LF_KT / 16];
 +        if constexpr (ORD) {
@@ -604,7 +613,7 @@ index 000000000..c08f11259
 +            }
 +        lf_pipe_ds_wmma<(D / 16) * (LF_KT / 32)>();
 +        }
-+        lf_lds_barrier();
++        lf_fa_iter_barrier();
 +    }
 +    l += __shfl_xor_sync(0xFFFFFFFF, l, 16, 32);
 +    if (tq >= n_q) return;

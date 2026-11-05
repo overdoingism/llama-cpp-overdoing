@@ -7,7 +7,7 @@ the [README](README.md#patches).  Written with Claude (AI).
 | patch | what | switch | type | needs |
 |---|---|---|---|---|
 | `0001-605-k1-v7` | prefill matmuls of K-quant weights through hipBLASLt in fp8 (or f16); fp8 corrects the largest activation channels.  v7 = v6 with the residual ADD in the GEMM, the channel amax in the RMS norm and a faster weight conversion, the same output (+7.8 % at depth 0, +4.7 % at 32K on 2048-token batches).  v6 = v4 also taking batches of 384..1023 tokens on weights of 20M elements or more (a prompt's last batch, short prompts, the draft's batches), and converting Q4_K / Q5_K / IQ4_XS weights without the LDS round trip (same bytes, faster) | `GGML_LF_KQ_BLAS`<br>(default `fp8` when every GPU is a gfx1201; `0` = off);<br>`GGML_LF_DRAFT_UB`<br>(default `512`) shrinks the draft model's ubatch | speed/lossy | hipBLASLt |
-| `0002-605-f8-v6` | prefill flash attention in fp8 (and no growing F16 staging copy).  v6 = v5 with barriers that order LDS only and, where measured faster, the WMMAs of two accumulators issued in turn, the same output.  v5 = v4 with the row sum counted from the fp8 probabilities (numerator and denominator from the same numbers); v4 = v3.3, on by default | `GGML_LF_FA_FP8`<br>(default on; `0` = off) | speed/lossy | — |
+| `0002-605-f8-v7` | prefill flash attention in fp8 (and no growing F16 staging copy).  v7 = v6 with its barrier written as the RDNA4 decode band's, the same machine code.  v6 = v5 with barriers that order LDS only and, where measured faster, the WMMAs of two accumulators issued in turn, the same output.  v5 = v4 with the row sum counted from the fp8 probabilities (numerator and denominator from the same numbers); v4 = v3.3, on by default | `GGML_LF_FA_FP8`<br>(default on; `0` = off) | speed/lossy | — |
 | `0003-605-m4-v4` | MXFP4 weights converted exactly to fp8 for K1's fp8 GEMM.  v4 = v3 with the residual ADD in the GEMM, as K1, the same logits (+2.0..+2.5 %).  v3 = v2, on by default | `GGML_LF_MXFP4_DIRECT`<br>(default `blaslt`; `0` = off) | speed/lossy | 0001 |
 | `0004-605-reasoning-guard-v2` | an end of turn sampled inside the reasoning block becomes the block's end tag, so the model writes its answer instead of ending with the answer left in the reasoning and an empty reply (seen with clients that send earlier reasoning back as plain text, over long contexts).  v2 = v1, on by default | `LLAMA_REASONING_GUARD`<br>(default on; `0` = off) | guard | — |
 | `0005-605-state-bands-v1` | a state above `LLAMA_STATE_ASYNC_MAX_MIB` (256 MiB; the server's prompt cache saving or restoring a slot of a long context) takes the batched path the checkpoints take, one band at a time through the same pinned stage, instead of per-tensor copies into pageable memory.  The same bytes.  Only on a single device: a band may cut a piece at any byte, which a `-sm tensor` split does not serve | `LLAMA_STATE_ASYNC_BANDS`<br>(default on with one device; `0` = off, `1` = forced on) | speed | — |
@@ -23,6 +23,11 @@ the [README](README.md#patches).  Written with Claude (AI).
 Type: `memory` = less VRAM, same output; `speed/lossy` = faster, with error above the run-to-run floor (or, for 0007, a bounded change of the output distribution); `speed/diff` = faster, output not bit-identical to the stock code but within the floor; `guard` = changes behavior only in a failure case; `speed/trade-off` = faster on some workloads and slower on others.
 
 ## Change log
+
+**2026-11-05:** `0002` v7.  The tile loop's LDS-only barrier is written as rdna-boosts' RDNA4 decode band's
+(`flash_attn_ext_f16_iter_barrier` in `fattn-mma-f16.cuh`), with its `__syncthreads()` fallback for other targets.  The
+gfx1201 code is byte for byte the one of v6, so the output and speed do not change.  A tree with v6 needs only this
+patch's change to `lf-fa-fp8.cu`.
 
 **2026-11-04:** documentation only.  The example command (README, `run-server-sample.ps1`, the package README) uses
 DFlash2 drafts alone; `0014` and its parameters are described in SWITCHES.md.  Every patch can be turned off with its

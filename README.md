@@ -15,7 +15,7 @@ File names: `<serial>-<upstream base>-<name>-v<version>.patch`.  The files in `p
 | patch | what | switch | type |
 |---|---|---|---|
 | `0001-605-k1-v7` | K-quant prefill matmuls via hipBLASLt | `GGML_LF_KQ_BLAS`<br>(default on, fp8) | speed/<br>lossy |
-| `0002-605-f8-v6` | fp8 prefill attention | `GGML_LF_FA_FP8`<br>(default on) | speed/<br>lossy |
+| `0002-605-f8-v7` | fp8 prefill attention | `GGML_LF_FA_FP8`<br>(default on) | speed/<br>lossy |
 | `0003-605-m4-v4` | MXFP4 weights to fp8 for `0001` | `GGML_LF_MXFP4_DIRECT`<br>(default on) | speed/<br>lossy |
 | `0004-605-reasoning-guard-v2` | no reply left inside the reasoning | `LLAMA_REASONING_GUARD`<br>(default on) | guard |
 | `0005-605-state-bands-v1` | saving and restoring a slot above 256 MiB through the fast batched path | `LLAMA_STATE_ASYNC_BANDS`<br>(default on, one device) | speed |
@@ -58,7 +58,7 @@ a fifth (0.000396 to 0.000307, floor 0.00021); with all defaults the change is b
 ([report](reports/2026-10-27.md#0002-v5-the-row-sum-of-f8)).  On the table's 48K test v5 is within the floor of v4 (F8 alone
 0.0019 / 0.0007 with v4; all defaults 0.0024 / 0.0008 with v4).  F8 v6 gives the same output as v5 (LDS-only barriers, and
 the WMMAs of two accumulators issued in turn where that is faster): F8's kernel +2.7..+4.3 % on Qwen3.8-27B's shape,
-prefill +0.5 % at 32K and +0.6 % at 110K ([change log](PATCHES.md#change-log)).
+prefill +0.5 % at 32K and +0.6 % at 110K ([change log](PATCHES.md#change-log)); v7 is v6 with the same machine code.
 
 `0009` changes only draft-verification batches of 9-16 rows (two slots verifying at once, or a long n-gram draft), which
 neither the KLD run nor the standard benchmark has; each of those rows then gets the result a batch of 8 rows or fewer gives.
